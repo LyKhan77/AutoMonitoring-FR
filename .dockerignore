@@ -1,0 +1,16 @@
+# Docker
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# Git
+.git
+.gitignore
+
+# Data & Cache (dikelola oleh volumes)
+db/
+captures/
+attendance_captures/
+face_images/
+_tensorrt_cache/
+__pycache__/

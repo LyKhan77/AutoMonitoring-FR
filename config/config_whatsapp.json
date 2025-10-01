@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "provider": "http",
+  "endpoint_url": "https://authserver-backend.iotech.my.id/send-multi-whatsapp",
+  "source": "FaceRecognitionApp",
+  "use_hr_id": true,
+  "supervisor_ids": [24, 31, 57],
+  "rate_limit_per_min": 30,
+  "dedupe_cooldown_sec": 60
+}

@@ -1,0 +1,32 @@
+services:
+  fr-webapp:
+    image: gspe-fr:latestSEP
+    container_name: fr-webapp
+    # Aktifkan build agar 'docker compose up --build' berfungsi
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    # GPU (butuh NVIDIA Container Toolkit)
+    gpus: all
+    environment:
+      - TZ=Asia/Jakarta
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    volumes:
+      - ./db:/app/db
+      - ./captures:/app/captures
+      - ./attendance_captures:/app/attendance_captures
+      - ./camera_configs:/app/camera_configs
+      - ./config:/app/config
+      - ./_tensorrt_cache:/app/_tensorrt_cache
+      - ./face_images:/app/face_images
+    restart: unless-stopped
+    # Healthcheck opsional:
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/config/params"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

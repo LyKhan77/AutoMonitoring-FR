@@ -1,0 +1,8 @@
+{
+    "id": 3,
+    "name": "CAM 2",
+    "area": "IT Departement",
+    "rtsp_url": "0",
+    "enabled": false,
+    "stream_enabled": false
+}
