@@ -80,12 +80,7 @@
       }
       if (elNotifBadge){ const c=state.unread; if (c>0){ elNotifBadge.textContent = '!'; elNotifBadge.classList.remove('hidden'); } else { elNotifBadge.classList.add('hidden'); } } }
     function pushRaw(msg){
-      // Guard against immediate duplicate messages
-      if (state.recentMsgs.has(msg)) return;
-      state.recentMsgs.add(msg);
-      if (state.recentMsgs.size > 100){ // trim set
-        state.recentMsgs = new Set(Array.from(state.recentMsgs).slice(-80));
-      }
+      // Deduplication is now handled by the caller via pushKeyed with a unique key.
       state.history.unshift({msg, ts: Date.now()});
       if (state.history.length > 200) state.history.length = 200;
       state.unread+=1; saveHistory(); playNotifSound(); render();

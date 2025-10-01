@@ -61,7 +61,8 @@
       if (lower.includes('back to area') || lower.includes('out of area since')) {
       try{
         const NC = (window.App && window.App.NotificationCenter) ? window.App.NotificationCenter : null;
-        if (NC){ NC.pushKeyed(`alert:${empId}:${typ}:${log.timestamp||Date.now()}`, msg, 45000); }
+        if (NC){
+          NC.pushKeyed(`alert:${empId}:${typ}:${log.timestamp||Date.now()}`, msg, 45000); }
       }catch(_){ }
       try{
         if (elAlerts){ const n = parseInt(elAlerts.textContent||'0',10); elAlerts.textContent = String((isFinite(n)?n:0)+1); }
