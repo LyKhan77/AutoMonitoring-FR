@@ -166,12 +166,15 @@ class AlertLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'))
+    camera_id = Column(Integer, ForeignKey('cameras.id'), nullable=True)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     alert_type = Column(String)  # contoh: OUT_OF_AREA
     message = Column(String)
     notified_to = Column(String)  # contoh: Supervisor John Doe / phone number
+    notified_telegram = Column(Boolean, default=False, nullable=False, index=True)
 
     employee = relationship("Employee", back_populates="alert_logs")
+    camera = relationship("Camera")
 
 
 # --- Utilitas DB --- #
@@ -179,13 +182,27 @@ class AlertLog(Base):
 def init_db() -> None:
     """Buat semua tabel jika belum ada."""
     Base.metadata.create_all(bind=engine)
-    # Lightweight migration: rename cameras.location_zone -> cameras.area (if needed)
+    # --- Lightweight Migrations ---
     try:
         with engine.begin() as conn:
+            # 1. Rename cameras.location_zone -> cameras.area (if needed)
             rows = conn.exec_driver_sql("PRAGMA table_info(cameras)").fetchall()
             cols = {r[1] for r in rows}  # name at index 1
             if 'area' not in cols and 'location_zone' in cols:
                 conn.exec_driver_sql("ALTER TABLE cameras RENAME COLUMN location_zone TO area")
+                print("[DB Migration] Renamed column cameras.location_zone to cameras.area")
+            
+            # 2. Add notified_telegram to alert_logs (if needed)
+            rows_alerts = conn.exec_driver_sql("PRAGMA table_info(alert_logs)").fetchall()
+            cols_alerts = {r[1] for r in rows_alerts}
+            if 'notified_telegram' not in cols_alerts:
+                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN notified_telegram BOOLEAN DEFAULT 0 NOT NULL")
+                print("[DB Migration] Added column alert_logs.notified_telegram")
+            
+            # 3. Add camera_id to alert_logs (if needed)
+            if 'camera_id' not in cols_alerts:
+                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN camera_id INTEGER")
+                print("[DB Migration] Added column alert_logs.camera_id")
     except Exception:
         pass
     print(f"Database initialized ({DB_FILE})")
@@ -223,7 +240,7 @@ def seed_cameras_from_configs(camera_dir: str = 'camera_configs') -> int:
                 cam_name = cfg.get('name') or f"CAM {cam_id}"
                 rtsp_url = cfg.get('rtsp_url', '')
                 # optional location in config
-                location_zone = cfg.get('location') or cfg.get('zone')
+                location_zone = cfg.get('area') or cfg.get('location') or cfg.get('zone')
 
                 cam = db.get(Camera, cam_id)
                 if cam is None:

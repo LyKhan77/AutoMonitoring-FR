@@ -19,9 +19,8 @@ import ctypes.wintypes as wintypes
 
 from flask import Flask, jsonify, render_template, request, send_file, Response, send_from_directory
 from flask_socketio import SocketIO, emit
-from database_models import SessionLocal, Employee, Camera, FaceTemplate, Attendance, Presence, Event, AlertLog  # DB models
+from database_models import SessionLocal, Employee, Camera, FaceTemplate, Attendance, Presence, Event, AlertLog, init_db
 from database_models import seed_cameras_from_configs
-from helpers.whatsapp import init_sender as wa_init_sender, enqueue_to_supervisors as wa_enqueue
 
 # --- TensorRT Engine Cache Configuration ---
 # Set a dedicated cache directory to prevent cluttering the root folder.
@@ -1536,6 +1535,7 @@ def api_alert_logs_create():
                 timestamp=now_utc,
                 alert_type=alert_type,
                 message=message or None,
+                camera_id=(int(cam_id_payload) if cam_id_payload is not None else None),
                 notified_to=None,
             )
             db.add(row)
@@ -1550,15 +1550,6 @@ def api_alert_logs_create():
                     'employee_name': (emp.name or None),
                     'department': (emp.department or None)
                 })
-            except Exception:
-                pass
-            # Enqueue WhatsApp notification to supervisors (non-blocking)
-            try:
-                emp_name = emp.name or f"Emp {emp.id}"
-                dept = emp.department or '-'
-                when = now_utc.strftime('%H:%M') + 'Z'
-                short = f"{alert_type}: {emp_name} ({dept}) {when}"
-                wa_enqueue(short, key_hint=f"emp{emp.id}:{alert_type}")
             except Exception:
                 pass
             # Try to save dedicated attendance capture
@@ -2499,12 +2490,7 @@ if __name__ == '__main__':
             _start_capture_saver_thread()
         except Exception:
             pass
-        print("Menjalankan server di http://0.0.0.0:5000")
-        # Initialize WhatsApp sender if enabled in config/config_whatsapp.json
-        try:
-            wa_init_sender()
-        except Exception:
-            pass
+        # Initialize Telegram sender if enabled
         socketio.run(app, 
                     host='0.0.0.0', 
                     port=5000,
