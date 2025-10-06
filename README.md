@@ -172,9 +172,13 @@ Most runtime parameters are in `config/parameter_config.json`. Important keys:
 - Alerts: `alert_min_interval_sec`
 - Attendance: `attendance_first_in_overwrite_enabled`, `attendance_last_out_delay_sec`, `attendance_captures_retention_days`
 
-WhatsApp config lives separately in `config/config_whatsapp.json`:
-- `enabled`, `provider` ("meta"), `phone_number_id`, `access_token_env`, `supervisors` list
-  - Do NOT store tokens in repo; set env var `WHATSAPP_ACCESS_TOKEN` at runtime.
+### 📲 Telegram Bot Integration (NEW)
+
+- **Real-time Alert**: System automatically sends alert messages to Telegram chats that have activated the bot via /start.
+- **Attendance Report via Bot**: Request daily attendance (with first-in/last-out photos) directly from the bot.
+- **Easy Activation/Deactivation**: Use /start and /stop to control alert delivery in each chat.
+- **Interactive Reports**: Select date and employee using inline keyboards for fast attendance lookups.
+- **Multi-Chat Support**: Multiple Telegram chats (groups or individuals) can receive the same alerts.
 
 ## Usage
 
@@ -213,6 +217,17 @@ WhatsApp config lives separately in `config/config_whatsapp.json`:
 - View current alerts in notification dropdown
 - Alert history stored in database
 - Alerts resolved when employees return
+
+#### Telegram Bot
+1. Start the bot with `/start` in a Telegram chat.
+2. Receive real-time alerts when employees are absent/out of area.
+3. Request attendance: send `/attendance`, select a date and employee, get instant report with photo.
+4. Pause notifications with `/stop`.
+#### Technical Notes
+- Bot runs separately (`telegram.py`).
+- Polls database every 5 seconds for new alerts, marks as sent after delivery.
+- Attendance report pulls meta and images from local storage.
+- All DB operations isolated for robustness.
 
 ## Database Schema
 
