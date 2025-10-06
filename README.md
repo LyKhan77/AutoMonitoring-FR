@@ -219,10 +219,11 @@ Most runtime parameters are in `config/parameter_config.json`. Important keys:
 - Alerts resolved when employees return
 
 #### Telegram Bot
-1. Start the bot with `/start` in a Telegram chat.
-2. Receive real-time alerts when employees are absent/out of area.
-3. Request attendance: send `/attendance`, select a date and employee, get instant report with photo.
-4. Pause notifications with `/stop`.
+Open the Telegram app.
+1. Search for and start a chat with the bot: @gspe_automonitoring_bot.
+2. Send the command /start to begin receiving alerts.
+3. Send /attendance to request an attendance report.
+4. Use /stop to stop notifications in that chat.
 #### Technical Notes
 - Bot runs separately (`telegram.py`).
 - Polls database every 5 seconds for new alerts, marks as sent after delivery.
