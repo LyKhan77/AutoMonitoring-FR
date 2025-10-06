@@ -46,6 +46,14 @@ A real-time employee monitoring system using CCTV cameras and face recognition t
 - Settings and configuration pages
  - Report page with Reset Logs (Events/Alert Logs) by date range
 
+### 📲 Telegram Bot Integration (NEW)
+
+- **Real-time Alert**: System automatically sends alert messages to Telegram chats that have activated the bot via /start.
+- **Attendance Report via Bot**: Request daily attendance (with first-in/last-out photos) directly from the bot.
+- **Easy Activation/Deactivation**: Use /start and /stop to control alert delivery in each chat.
+- **Interactive Reports**: Select date and employee using inline keyboards for fast attendance lookups.
+- **Multi-Chat Support**: Multiple Telegram chats (groups or individuals) can receive the same alerts.
+
 ## System Architecture
 
 ```
@@ -171,14 +179,6 @@ Most runtime parameters are in `config/parameter_config.json`. Important keys:
 - Presence: `tracking_timeout`, `present_timeout_sec`
 - Alerts: `alert_min_interval_sec`
 - Attendance: `attendance_first_in_overwrite_enabled`, `attendance_last_out_delay_sec`, `attendance_captures_retention_days`
-
-### 📲 Telegram Bot Integration (NEW)
-
-- **Real-time Alert**: System automatically sends alert messages to Telegram chats that have activated the bot via /start.
-- **Attendance Report via Bot**: Request daily attendance (with first-in/last-out photos) directly from the bot.
-- **Easy Activation/Deactivation**: Use /start and /stop to control alert delivery in each chat.
-- **Interactive Reports**: Select date and employee using inline keyboards for fast attendance lookups.
-- **Multi-Chat Support**: Multiple Telegram chats (groups or individuals) can receive the same alerts.
 
 ## Usage
 
