@@ -1,86 +1,104 @@
 # GSPE Auto-Monitoring System
 
-A real-time employee monitoring system using CCTV cameras and face recognition technology. The system provides live video streaming, automatic employee presence tracking, alert notifications, and comprehensive attendance management.
+An AI-powered, real-time employee monitoring and attendance tracking platform.  
+It combines face recognition, CCTV stream analysis, and intelligent scheduling to automatically log attendance, detect policy violations, and provide live updates via web dashboard and Telegram bot.
 
-## Features
+---
 
-### 🎥 Live CCTV Streaming
-- Real-time video streaming from multiple cameras
-- Socket.IO-based frame transmission for low latency
-- Dynamic camera switching and management
-- AI inference status indicator (Online/Offline)
+## 🔍 Overview
 
-### 👤 Face Recognition & Tracking
-- Advanced face detection and recognition using InsightFace
-- Employee embedding storage and matching
-- Real-time presence status updates
-- Tracking-by-detection with IOU association to stabilize IDs and boxes
-- Temporal ID smoothing (majority vote) to reduce flicker/switching
-- Configurable similarity thresholds
-- Face quality gating (blur, brightness, size) before casting votes
+The GSPE Auto-Monitoring System processes live RTSP CCTV streams, recognizes employees using deep-learning models (`insightface` + `onnxruntime-gpu`), and automatically records `First In`/`Last Out` times.  
+It enforces work-hour policies, generates violation alerts, and supports both **automatic** and **manual** schedule modes.  
+Users can monitor the system through a **web dashboard** or receive updates via a **Telegram bot**.
 
-### 🚨 Smart Alert System
-- Automatic alert generation when employees are absent (configurable timeout)
-- Persistent alert logging in database (`alert_logs`)
-- Real-time notification dropdown with badge counter (client UI)
-- Alert resolution tracking when employees return
-- Event rate control to prevent database spam for repeated sightings (configurable: `alert_min_interval_sec`)
-- Off-hours & pause gating (alerts/captures suppressed based on schedule state)
-- Optional WhatsApp notifications to Supervisors (via Meta Cloud API), async & rate-limited
+---
 
-### 📊 Attendance Management
-- Daily attendance tracking with dedicated captures:
-  - `first_in.jpg` and `last_out.jpg` per employee per day
-  - First-In overwrite policy (`attendance_first_in_overwrite_enabled`)
-  - Last-Out optional delay to stabilize frame (`attendance_last_out_delay_sec`)
-  - Daily retention job cleans old folders (`attendance_captures_retention_days`)
-- Employee presence status (Available/Off)
-- Comprehensive event logging
-- Daily maintenance (events purge + attendance captures retention)
+## ✨ Key Features
 
-### 🖥️ Web Dashboard
-- Modern responsive UI built with Tailwind CSS
-- Live employee tracking panel
-- Camera management interface
-- Employee registration with face capture
-- Settings and configuration pages
- - Report page with Reset Logs (Events/Alert Logs) by date range
+### 🎥 Real-time Face Recognition
+- Detects and identifies employees from multiple RTSP cameras.
+- Tracks faces with IOU-based association and temporal ID smoothing.
+- Performs face quality gating (blur, brightness, and size thresholds).
+- Multi-pose registration (front, left, right) for robust recognition.
 
-### 📲 Telegram Bot Integration (NEW)
+### 🕐 Automated Attendance Tracking
+- Automatically captures and stores:
+  - `first_in.jpg` and `last_out.jpg` per employee per day.
+- Supports delayed last-out stabilization and configurable overwrite policy.
+- Cleans old attendance captures with a daily retention job.
 
-- **Real-time Alert**: System automatically sends alert messages to Telegram chats that have activated the bot via /start.
-- **Attendance Report via Bot**: Request daily attendance (with first-in/last-out photos) directly from the bot.
-- **Easy Activation/Deactivation**: Use /start and /stop to control alert delivery in each chat.
-- **Interactive Reports**: Select date and employee using inline keyboards for fast attendance lookups.
-- **Multi-Chat Support**: Multiple Telegram chats (groups or individuals) can receive the same alerts.
+### 🧠 Advanced Schedule Control
+- Define work hours and lunch breaks.
+- Switch between auto-schedule and manual override.
+- Temporarily pause the system (e.g., maintenance or breaks).
+- Historical accuracy: violations are always computed against the rules active *at event time*.
+
+### 🚨 Violation & Alert Reporting
+- Detects unexpected `EXIT` events during work hours.
+- Alerts stored with contextual metadata (schedule state, timestamp).
+- Notification rate control to prevent database flooding.
+- Off-hours gating to suppress irrelevant alerts.
+
+### 🖥️ Live Web Dashboard
+- Modern, responsive interface (Tailwind CSS).
+- Live camera feeds with AI overlay and employee status.
+- Management panels for employees, cameras, and schedules.
+- Real-time Socket.IO updates and alert badge indicators.
+- Reporting tools with daily attendance, alert logs, and maintenance options.
+
+### 📲 Interactive Telegram Bot
+- Independent, multi-threaded process (`telegram.py`).
+- Sends real-time ENTER/EXIT alerts to groups or individual chats.
+- `/status` – returns system state (online/offline, schedule mode).
+- `/attendance` – fetches attendance reports with photos.
+- Announces schedule changes and supports multiple chats concurrently.
+
+### 🗄️ Persistent Data Storage
+- SQLite database (`attendance.db`) via SQLAlchemy ORM.
+- Core tables: employees, face_templates, cameras, events, attendances, alert_logs, presence.
+- Includes maintenance tasks (event purge, daily retention).
 
 ## System Architecture
 
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Frontend      │    │   Backend       │    │   AI Engine    │
-│   (HTML/JS)     │◄──►│   (Flask)       │◄──►│   (module_AI)   │
-│                 │    │                 │    │                 │
-│ • Live Stream   │    │ • REST APIs     │    │ • Face Detect   │
-│ • Notifications │    │ • Socket.IO     │    │ • Recognition   │
-│ • Management    │    │ • Maintenance   │    │ • Tracking      │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-                                │
-                       ┌─────────────────┐
-                       │   Database      │
-                       │   (SQLite)      │
-                       │                 │
-                       │ • Employees     │
-                       │ • Events        │
-                       │ • Attendance    │
-                       │ • Alerts        │
-                       └─────────────────┘
+## 🧩 System Architecture
 
-External Notification (optional):
 ```
-Backend ──(async queue)──> WhatsApp Cloud API ──> Supervisors
+                 +-------------------------+
+                 |   RTSP Camera Streams   |
+                 +-----------+-------------+
+                             |
+                             v
++-----------------------------------------------------------------------+
+|   +-----------------------+        +--------------------------------+ |
+|   |    module_AI.py       |------->|             app.py             | |
+|   | (Face Engine/Tracker) |        | (Flask API, Web UI, SocketIO)  | |
+|   +-----------------------+        +--------------------------------+ |
+|          ^          |                      |            |             |
+|          |          |                      |            v             |
+|          |          +------> attendance.db <+     Web Dashboard       |
+|          |                                        (Browser Client)    |
++-----------------------------------------------------------------------+
+                             |
+                             v
+                    +-----------------------+
+                    |     telegram.py       |
+                    | (Standalone Bot Proc) |
+                    +-----------+-----------+
+                                |
+                                v
+                    +-----------------------+
+                    |   Telegram API/Group  |
+                    +-----------------------+
 ```
-```
+
+**Modules:**
+- **`module_AI.py`** – Handles video decoding, face recognition, tracking, and live presence state.
+- **`app.py`** – Flask web server providing REST APIs, business logic, and Socket.IO events.
+- **`database_models.py`** – SQLAlchemy schema for all persistent entities.
+- **`telegram.py`** – Asynchronous Telegram bot; polls and listens independently.
+- **`attendance.db`** – Local SQLite database for all runtime records.
+
+---
 
 ## Installation
 
@@ -99,23 +117,29 @@ Key packages: Flask(+SocketIO), SQLAlchemy, OpenCV, InsightFace/ONNX Runtime, Nu
 
 ### Setup
 
-1. **Clone the repository**
-```bash
-git clone <repository-url>
-cd FR-V3
-```
+## ⚙️ Installation & Setup
 
-2. **Install dependencies**
-```bash
-pip install -r requirements.txt
-```
+1. **Clone the Repository**
+   ```bash
+   git clone <repository-url>
+   cd AutoMonitoring-FR
+   ```
 
-3. **Initialize database**
-```bash
-python database_models.py
-```
+2. **Create Virtual Environment & Install Dependencies**
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # Windows: venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+   *Ensure a compatible NVIDIA driver and CUDA toolkit for `onnxruntime-gpu`.*
 
-4. **Configure cameras**
+3. **Initialize Database**
+   ```bash
+   python database_models.py
+   ```
+
+4. **Configure Components**
+   - **Cameras:** `camera_configs/CAM1/config.json`
    - Create camera configs in `camera_configs/CAM{ID}/config.json`
    - Example config:
 ```json
@@ -127,33 +151,19 @@ python database_models.py
     "location": "Entrance Zone"
 }
 ```
+   - **Telegram Bot:** `config/config_telegram.json`
+   - **AI Parameters:** `config/parameter_config.json`
 
-Additional/advanced parameters supported (optional):
+5. **Run Web Application**
+   ```bash
+   python app.py
+   ```
+   Dashboard → `http://0.0.0.0:5000`
 
-- Tracking & smoothing
-  - `smoothing_window` (int, default 5)
-  - `smoothing_min_votes` (int, default 3)
-  - `tracker_iou_threshold` (float, default 0.3)
-  - `tracker_max_misses` (int, default 8)
-- Event rate control
-  - `event_min_interval_sec` (float seconds, default 5.0)
-- Quality gating
-  - `quality_min_blur_var` (float, default 50.0)
-  - `quality_min_face_area_frac` (float, default 0.01)
-  - `quality_min_brightness` (float 0..1, default 0.15)
-  - `quality_max_brightness` (float 0..1, default 0.9)
-  - `quality_min_score` (float 0..1, default 0.3)
-
-5. **Configure AI parameters** (optional)
-   - Edit `parameter_config.json` for detection thresholds and settings
-
-6. **Run the application**
-```bash
-python app.py
-```
-
-7. **Access the dashboard**
-   - Open browser: `http://localhost:5000`
+6. **Run Telegram Bot**
+   ```bash
+   python telegram.py
+   ```
 
 ## Configuration
 
@@ -251,37 +261,21 @@ Employee 1:N AlertLog
 Camera 1:N Event
 ```
 
-## API Endpoints
+## 🔗 Core API Endpoints
 
-### REST APIs
-- `GET /api/cameras` - List all cameras
-- `GET /api/employees` - List all employees
-- `POST /api/employees` - Create new employee
-- `PUT /api/employees/{id}` - Update employee
-- `DELETE /api/employees/{id}` - Delete employee
-- `GET /api/tracking/state` - Get current tracking state
-
-#### Admin
-- `POST /api/admin/reset_logs` - Delete events and/or alert_logs by date range
-  - Request JSON:
-    ```json
-    { "table": "events"|"alert_logs"|"both", "from_date": "YYYY-MM-DD", "to_date": "YYYY-MM-DD" }
-    ```
-  - Notes:
-    - If `from_date`/`to_date` omitted, deletes all rows in selected table(s).
-    - Dates are inclusive; span entire days.
-  - Response JSON:
-    ```json
-    { "ok": true, "deleted_events": 123, "deleted_alert_logs": 45 }
-    ```
-
-### Socket.IO Events
-- `start_stream` - Start camera streaming
-- `stop_stream` - Stop camera streaming
-- `frame` - Receive video frame
-- `stream_error` - Stream error notification
-- `stream_stopped` - Stream stopped notification
- - (Optional) `alert_log_created` client listener can push UI notifications (if wired)
+| Method | Endpoint | Description |
+|--------|-----------|-------------|
+| GET | `/api/cameras` | List all cameras |
+| GET | `/api/employees` | List all employees |
+| POST | `/api/employees` | Add employee |
+| POST | `/api/employees/<id>/face_templates` | Register face |
+| GET | `/api/report/attendance` | Get attendance summary |
+| GET | `/api/report/alerts` | Retrieve alert logs |
+| GET | `/api/schedule/state` | Get current schedule |
+| POST | `/api/schedule/mode` | Switch schedule mode |
+| POST | `/api/schedule/pause` | Temporarily suspend monitoring |
+| POST | `/api/system/restart` | Restart system |
+| POST | `/api/system/shutdown` | Shut down application |
 
 ## Maintenance
 
@@ -301,62 +295,48 @@ python database_models.py
 # Monitor logs in console output
 ```
 
-## Troubleshooting
+## 🧹 Maintenance & Troubleshooting
 
-### Common Issues
+**Automatic Tasks:**
+- Daily event purge.
+- Retention cleanup for attendance captures.
+- Startup consistency checks.
 
-**Camera not connecting:**
-- Verify RTSP URL and credentials
-- Check network connectivity
-- Ensure camera supports H.264 encoding
+**Manual Maintenance:**
+```bash
+python database_models.py  # Reinitialize DB
+```
 
-**Face recognition not working:**
-- Check lighting conditions
-- Verify face template registration
-- Adjust similarity threshold in config
-
-**Performance issues:**
-- Reduce camera resolution/FPS
-- Check CPU/memory usage
-- Consider hardware acceleration
-
-**Database errors:**
-- Check file permissions for `attendance.db`
-- Ensure SQLite is properly installed
-- Backup and reinitialize if corrupted
-
-### Logs
-Monitor console output for:
-- Camera connection status
-- Face recognition events
-- Database operations
-- Error messages
+**Common Issues:**
+- RTSP errors → check camera URL or encoding.
+- GPU inference lag → adjust `fps_target` or use lower resolution.
+- Recognition drift → update face templates and adjust similarity threshold.
 
 ## Development
 
 ### Project Structure
 ```
-FR-V3/
-├── app.py                     # Main Flask application
-├── module_AI.py               # AI/Face recognition engine
-├── telegram.py                # Telegram bot integration
-├── database_models.py         # Database models and ORM (+light migrations)
-├── requirements.txt           # Python dependencies
+```
+AutoMonitoring-FR/
+├── app.py
+├── module_AI.py
+├── telegram.py
+├── database_models.py
 ├── config/
-│   ├── parameter_config.json  # Runtime parameters (AI/RTSP/Attendance)
-│   ├── tracking_mode.json     # Tracking / Schedule system configuration
-│   └── config_telegram.json   # Telegram Config
-├── static/                    # JS/CSS assets
-├── templates/                 # HTML templates
-├── camera_configs/            # Camera JSON configs (per CAM folder)
-├── captures/                  # Rolling per-camera snapshots (runtime)
-├── attendance_captures/       # First-In/Last-Out captures (runtime)
-├── db/
-│   └── attendance.db          # SQLite database (ignored by .gitignore)
-├── Dockerfile                 # CUDA 12.8 + Python 3.10.18 base (x86_64)
-├── docker-compose.yaml        # Optional runtime stack
-├── Installation.md            # RTX 5090/Server install guide
-└── docker-run.md              # How to build/run (CMD/PowerShell/WSL)
+│   ├── parameter_config.json
+│   ├── config_telegram.json
+│   └── tracking_mode.json
+├── camera_configs/
+│   ├── CAM1/config.json
+│   ├── CAM2/config.json
+│   └── ...
+├── db/attendance.db
+├── templates/
+├── static/
+├── attendance_captures/
+├── Dockerfile
+├── docker-compose.yaml
+└── Installation.md
 ```
 
 ### Adding New Features
@@ -372,12 +352,11 @@ FR-V3/
 - Verify attendance captures are created on ENTER/EXIT
 - Monitor WhatsApp deliveries (if enabled) and server logs
 
-## Security Considerations
-
-- RTSP credentials stored server-side (not exposed to frontend)
-- WhatsApp Access Token must be provided via environment variable (not in repo)
-- SQLite file permissions should be restricted
-- Consider HTTPS and authN/authZ for production deployments
+## 🔒 Security Considerations
+- RTSP credentials are server-side only.
+- Use environment variables for tokens (Telegram, WhatsApp).
+- Restrict access to `attendance.db` and system ports.
+- HTTPS and authentication recommended for production.
 
 ## Performance & Latency Optimization
 
@@ -422,4 +401,4 @@ For technical support or questions:
 
 ---
 
-**GSPE Auto-Monitoring System** - Intelligent employee monitoring with face recognition technology.
+**© PT GSPE – Intelligent Vision Systems for Workforce Automation**
