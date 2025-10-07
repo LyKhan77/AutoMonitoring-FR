@@ -100,7 +100,7 @@ Users can monitor the system through a **web dashboard** or receive updates via 
 
 ---
 
-## Installation
+## ⚙️ Installation & Setup
 
 Refer to `Installation.md` for a complete guide (RTX 5090 server, CUDA 12.x, Docker/WSL notes).
 
@@ -108,16 +108,6 @@ Refer to `Installation.md` for a complete guide (RTX 5090 server, CUDA 12.x, Doc
 - Python 3.10+
 - RTSP cameras or streams (H.264 recommended)
 - Modern web browser
-
-### Dependencies (bare-metal)
-```bash
-pip install -r requirements.txt
-```
-Key packages: Flask(+SocketIO), SQLAlchemy, OpenCV, InsightFace/ONNX Runtime, NumPy.
-
-### Setup
-
-## ⚙️ Installation & Setup
 
 1. **Clone the Repository**
    ```bash
@@ -131,14 +121,16 @@ Key packages: Flask(+SocketIO), SQLAlchemy, OpenCV, InsightFace/ONNX Runtime, Nu
    source venv/bin/activate  # Windows: venv\Scripts\activate
    pip install -r requirements.txt
    ```
+   Key packages: Flask(+SocketIO), SQLAlchemy, OpenCV, InsightFace/ONNX Runtime, NumPy.
+   
    *Ensure a compatible NVIDIA driver and CUDA toolkit for `onnxruntime-gpu`.*
 
-3. **Initialize Database**
+4. **Initialize Database**
    ```bash
    python database_models.py
    ```
 
-4. **Configure Components**
+5. **Configure Components**
    - **Cameras:** `camera_configs/CAM1/config.json`
    - Create camera configs in `camera_configs/CAM{ID}/config.json`
    - Example config:
@@ -176,8 +168,9 @@ camera_configs/
 │   └── config.json
 ├── CAM2/
 │   └── config.json
-└── CAM3/
-    └── config.json
+├── CAM3/
+│   └── config.json
+└── .../
 ```
 
 ### AI & Runtime Parameters
