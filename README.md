@@ -308,28 +308,31 @@ python database_models.py  # Reinitialize DB
 ## Development
 
 ### Project Structure
-```
+
 ```
 AutoMonitoring-FR/
-├── app.py
-├── module_AI.py
-├── telegram.py
-├── database_models.py
+├── app.py                   # Flask web server & API
+├── module_AI.py             # Face recognition & tracking engine
+├── telegram.py              # Telegram bot process
+├── database_models.py       # SQLAlchemy models & DB init
 ├── config/
-│   ├── parameter_config.json
-│   ├── config_telegram.json
-│   └── tracking_mode.json
+│   ├── parameter_config.json   # AI/runtime parameters
+│   ├── config_telegram.json    # Telegram bot config
+│   └── tracking_mode.json      # Schedule/tracking mode
 ├── camera_configs/
-│   ├── CAM1/config.json
-│   ├── CAM2/config.json
-│   └── ...
-├── db/attendance.db
-├── templates/
-├── static/
-├── attendance_captures/
-├── Dockerfile
-├── docker-compose.yaml
-└── Installation.md
+│   ├── CAM1/
+│   │   └── config.json         # CAM1 camera config
+│   ├── CAM2/
+│   │   └── config.json         # CAM2 camera config
+│   └── .../
+├── db/
+│   └── attendance.db           # SQLite database file
+├── templates/                  # Frontend HTML templates
+├── static/                     # Static files (JS, CSS, images)
+├── attendance_captures/        # Attendance photos (first_in, last_out)
+├── Dockerfile                  # Docker build config
+├── docker-compose.yaml         # Multi-container orchestration
+└── Installation.md             # Installation guide
 ```
 
 ### Adding New Features
