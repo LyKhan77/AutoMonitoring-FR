@@ -54,6 +54,7 @@ os.makedirs(CAPTURE_DIR, exist_ok=True)
 TRACK_STATE_PATH = os.path.join(DB_DIR, 'tracking_mode.json')
 PARAMS_PATH = os.path.join(BASE_DIR, 'config', 'parameter_config.json')
 _camera_map: Dict[int, Dict[str, Any]] = {}
+_app_params: Dict[str, Any] = {}
 
 # --- Captures background saver (per-camera rolling cache) ---
 CAPTURES_DIR = os.path.join(BASE_DIR, 'captures')
@@ -241,21 +242,20 @@ def load_cameras() -> Dict[int, Dict[str, Any]]:
 
 # --- App parameters ---
 def load_params() -> Dict[str, Any]:
-    params = {}
+    global _app_params
+    if _app_params: # Return cached if already loaded
+        return _app_params
     try:
         if os.path.isfile(PARAMS_PATH):
             with open(PARAMS_PATH, 'r', encoding='utf-8') as f:
-                params = json.load(f) or {}
+                _app_params = json.load(f) or {}
     except Exception:
-        params = {}
+        _app_params = {}
     # Defaults
-    if 'away_mute_threshold_hours' not in params:
-        params['away_mute_threshold_hours'] = 15
-    if 'mark_absent_enabled' not in params:
-        params['mark_absent_enabled'] = True
-    if 'mark_absent_offset_minutes_before_end' not in params:
-        params['mark_absent_offset_minutes_before_end'] = 5
-    return params
+    _app_params.setdefault('away_mute_threshold_hours', 15)
+    _app_params.setdefault('mark_absent_enabled', True)
+    _app_params.setdefault('mark_absent_offset_minutes_before_end', 5)
+    return _app_params
 
 
 # --- Daily maintenance: purge events older than today ---
@@ -308,8 +308,7 @@ def schedule_midnight_purge():
 # --- Daily retention: cleanup old attendance captures ---
 def _cleanup_old_attendance_captures():
     try:
-        params = load_params() or {}
-        keep_days = int(params.get('attendance_captures_retention_days') or 30)
+        keep_days = int(_app_params.get('attendance_captures_retention_days') or 30)
         keep_days = max(1, min(3650, keep_days))
         cutoff = dt.date.today() - dt.timedelta(days=keep_days)
         root = ATT_CAPTURES_DIR
@@ -391,23 +390,33 @@ def _now_local():
     return dt.datetime.now()
 
 def _in_range(now: dt.datetime, rng: str) -> bool:
+    """Check if a UTC datetime falls within a local time range (HH:MM-HH:MM)."""
     (h1, m1), (h2, m2) = _parse_range(rng)
-    start = now.replace(hour=h1, minute=m1, second=0, microsecond=0)
-    end = now.replace(hour=h2, minute=m2, second=0, microsecond=0)
-    if end <= start:
-        # overnight range not expected here; treat as always false
-        return False
-    return start <= now <= end
+    try:
+        # The 'now' parameter is the timestamp of the log event (in UTC)
+        # Convert it to local time (WIB) for comparison against the schedule.
+        log_time_utc = now.replace(tzinfo=dt.timezone.utc)
+        wib_tz = dt.timezone(dt.timedelta(hours=7))
+        log_time_local = log_time_utc.astimezone(wib_tz)
+        
+        start_time = dt.time(h1, m1)
+        end_time = dt.time(h2, m2)
+        
+        # Compare the time part of the log event with the schedule range.
+        return start_time <= log_time_local.time() < end_time
+    except Exception:
+        return False # Default to false on any parsing/conversion error
 
 def _maybe_update_tracking_state():
-    now = _now_local()
+    now_utc = dt.datetime.utcnow()
     # Handle manual pause
     pu = _tracking_state.get('pause_until')
     pk = _tracking_state.get('pause_kind')
     if pu:
         try:
-            until = dt.datetime.fromisoformat(pu)
-            if now < until:
+            until = dt.datetime.fromisoformat(pu) # Assume pause_until is local server time
+            now_for_pause_check = _now_local()
+            if now_for_pause_check < until:
                 # During manual pause
                 kind = (pk or '').lower()
                 if kind == 'lunch':
@@ -427,8 +436,8 @@ def _maybe_update_tracking_state():
             _tracking_state['pause_until'] = None
             _tracking_state['pause_kind'] = None
     if bool(_tracking_state.get('auto_schedule', True)):
-        work_ok = _in_range(now, str(_tracking_state.get('work_hours', '08:30-17:30')))
-        lunch_on = _in_range(now, str(_tracking_state.get('lunch_break', '12:00-13:00')))
+        work_ok = _in_range(now_utc, str(_tracking_state.get('work_hours', '08:30-17:30')))
+        lunch_on = _in_range(now_utc, str(_tracking_state.get('lunch_break', '12:00-13:00')))
         _tracking_state['tracking_active'] = bool(work_ok)
         _tracking_state['suppress_alerts'] = bool(lunch_on)
     # persist periodically via caller
@@ -1310,19 +1319,31 @@ def api_report_attendance():
             for att, emp in rows:
                 # Violation count: number of EXIT alerts for this employee on this date (00:00:00 - 23:59:59.999)
                 vio = 0
+                # --- Smart Violation Counting ---
                 try:
                     from database_models import AlertLog
                     if att.date:
                         start_dt = dt.datetime.combine(att.date, dt.time.min)
                         end_dt = dt.datetime.combine(att.date, dt.time.max)
-                        vio = int(
-                            db.query(AlertLog)
-                              .filter(AlertLog.employee_id == att.employee_id)
-                              .filter(AlertLog.alert_type == 'EXIT')
-                              .filter(AlertLog.timestamp >= start_dt)
-                              .filter(AlertLog.timestamp <= end_dt)
-                              .count()
-                        )
+                        # Load schedule for that day to check contextually
+                        _maybe_update_tracking_state() # Ensure _tracking_state is fresh
+                        work_hours_str = _tracking_state.get('work_hours', '08:30-17:30')
+                        lunch_break_str = _tracking_state.get('lunch_break', '12:00-13:00')
+
+                        exit_logs = db.query(AlertLog).filter(
+                            AlertLog.employee_id == att.employee_id, AlertLog.alert_type == 'EXIT',
+                            AlertLog.timestamp >= start_dt, AlertLog.timestamp <= end_dt
+                        ).all()
+
+                        for log in exit_logs:
+                            # Use the schedule context snapshotted at the time of the log
+                            is_work_time = _in_range(log.timestamp, log.schedule_work_hours or work_hours_str)
+                            is_lunch_time = _in_range(log.timestamp, log.schedule_lunch_break or lunch_break_str)
+                            is_paused = bool(log.schedule_is_manual_pause) # Was a manual pause active?
+                            was_tracking_active = bool(log.schedule_tracking_active) # Was tracking forced ON?
+                            
+                            if was_tracking_active and not is_lunch_time and not is_paused:
+                                vio += 1
                 except Exception:
                     vio = 0
                 # Derive nearest captures for first/last
@@ -1374,18 +1395,31 @@ def api_report_attendance():
             # Violation count for CSV: number of EXIT alerts for this employee on this date
             vio = 0
             try:
+                # --- Smart Violation Counting for CSV ---
                 from database_models import AlertLog
                 if att.date:
                     start_dt = dt.datetime.combine(att.date, dt.time.min)
                     end_dt = dt.datetime.combine(att.date, dt.time.max)
-                    vio = int(
-                        db.query(AlertLog)
-                          .filter(AlertLog.employee_id == att.employee_id)
-                          .filter(AlertLog.alert_type == 'EXIT')
-                          .filter(AlertLog.timestamp >= start_dt)
-                          .filter(AlertLog.timestamp <= end_dt)
-                          .count()
-                    )
+                    # Load schedule for that day to check contextually
+                    _maybe_update_tracking_state() # Ensure _tracking_state is fresh
+                    work_hours_str = _tracking_state.get('work_hours', '08:30-17:30')
+                    lunch_break_str = _tracking_state.get('lunch_break', '12:00-13:00')
+
+                    exit_logs = db.query(AlertLog).filter(
+                        AlertLog.employee_id == att.employee_id,
+                        AlertLog.alert_type == 'EXIT',
+                        AlertLog.timestamp >= start_dt,
+                        AlertLog.timestamp <= end_dt
+                    ).all()
+
+                    for log in exit_logs:
+                        is_work_time = _in_range(log.timestamp, log.schedule_work_hours or work_hours_str)
+                        is_lunch_time = _in_range(log.timestamp, log.schedule_lunch_break or lunch_break_str)
+                        is_paused = bool(log.schedule_is_manual_pause) # Was a manual pause active?
+                        was_tracking_active = bool(log.schedule_tracking_active) # Was tracking forced ON?
+
+                        if was_tracking_active and not is_lunch_time and not is_paused:
+                            vio += 1
             except Exception:
                 vio = 0
             # Capture URLs
@@ -1493,17 +1527,16 @@ def api_report_alerts():
 
 @app.route('/api/config/params')
 def api_config_params():
-    p = load_params()
     # Also include work hours and lunch from tracking state for convenience
     _maybe_update_tracking_state()
     return jsonify({
-        'away_mute_threshold_hours': int(p.get('away_mute_threshold_hours') or 15),
+        'away_mute_threshold_hours': int(_app_params.get('away_mute_threshold_hours') or 15),
         'work_hours': str(_tracking_state.get('work_hours', '08:30-17:30')),
         'lunch_break': str(_tracking_state.get('lunch_break', '12:00-13:00')),
-        'mark_absent_enabled': bool(p.get('mark_absent_enabled', True)),
-        'mark_absent_offset_minutes_before_end': int(p.get('mark_absent_offset_minutes_before_end', 5)),
-        'alert_min_interval_sec': int(p.get('alert_min_interval_sec', 30)),
-        'notification_limit': int(p.get('notification_limit', 10)),
+        'mark_absent_enabled': bool(_app_params.get('mark_absent_enabled', True)),
+        'mark_absent_offset_minutes_before_end': int(_app_params.get('mark_absent_offset_minutes_before_end', 5)),
+        'alert_min_interval_sec': int(_app_params.get('alert_min_interval_sec', 30)),
+        'notification_limit': int(_app_params.get('notification_limit', 10)),
     })
 
 # --- Alert Logs: create from client-side tracking transitions ---
@@ -1517,19 +1550,17 @@ def api_alert_logs_create():
         cam_id_payload = payload.get('camera_id')
         if not emp_id or alert_type not in ('ENTER','EXIT'):
             return jsonify({'error': 'invalid_payload'}), 400
-        # Schedule gating: suppress during off-hours or lunch/pause
-        _maybe_update_tracking_state()
-        tracking_active = bool(_tracking_state.get('tracking_active', True))
-        suppressed_alerts = bool(_tracking_state.get('suppress_alerts', False))
-        if (not tracking_active) or suppressed_alerts:
-            reason = ('offhours' if not tracking_active else 'pause')
-            return jsonify({'ok': True, 'suppressed': True, 'reason': reason}), 200
         with SessionLocal() as db:
             # Optional: verify employee exists
             emp = db.get(Employee, int(emp_id))
             if not emp:
                 return jsonify({'error': 'employee_not_found'}), 404
             now_utc = dt.datetime.utcnow()
+            # Get current schedule state to snapshot it with the log
+            _maybe_update_tracking_state()
+            is_paused_now = bool(_tracking_state.get('pause_until'))
+            is_tracking_active_now = bool(_tracking_state.get('tracking_active'))
+            
             row = AlertLog(
                 employee_id=int(emp_id),
                 timestamp=now_utc,
@@ -1537,8 +1568,25 @@ def api_alert_logs_create():
                 message=message or None,
                 camera_id=(int(cam_id_payload) if cam_id_payload is not None else None),
                 notified_to=None,
+                schedule_work_hours=_tracking_state.get('work_hours'),
+                schedule_lunch_break=_tracking_state.get('lunch_break'),
+                schedule_is_manual_pause=is_paused_now,
+                schedule_tracking_active=is_tracking_active_now,
             )
             db.add(row)
+
+            # --- Direct Attendance Update ---
+            # If this is an EXIT log, directly update today's attendance last_out_ts
+            if alert_type == 'EXIT':
+                today = now_utc.date()
+                att = db.query(Attendance).filter(Attendance.employee_id == int(emp_id), Attendance.date == today).first()
+                if att:
+                    att.last_out_ts = now_utc
+                else:
+                    # Create attendance row if it doesn't exist for today
+                    att = Attendance(employee_id=int(emp_id), date=today, last_out_ts=now_utc, status='PRESENT')
+                    db.add(att)
+
             db.commit()
             # Notify connected clients in real-time
             try:
@@ -1571,11 +1619,10 @@ def api_alert_logs_create():
                 if cam_id is not None:
                     cams_meta = load_cameras(); meta = cams_meta.get(int(cam_id)) or {}
                     day_dir = os.path.join(ATT_CAPTURES_DIR, now_utc.date().isoformat(), str(int(emp_id)))
-                    params = load_params() or {}
-                    overwrite_first = bool(params.get('attendance_first_in_overwrite_enabled', False))
+                    overwrite_first = bool(_app_params.get('attendance_first_in_overwrite_enabled', False))
                     delay_sec = 0
                     try:
-                        delay_sec = int(params.get('attendance_last_out_delay_sec') or 0)
+                        delay_sec = int(_app_params.get('attendance_last_out_delay_sec') or 0)
                     except Exception:
                         delay_sec = 0
                     if alert_type == 'ENTER':
@@ -2479,6 +2526,8 @@ def api_system_shutdown():
 
 if __name__ == '__main__':
     try:
+        # Load parameters once at startup
+        load_params()
         # Daily maintenance: purge old events and schedule next purge
         try:
             purge_old_events()

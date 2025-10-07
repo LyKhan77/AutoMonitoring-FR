@@ -172,6 +172,11 @@ class AlertLog(Base):
     message = Column(String)
     notified_to = Column(String)  # contoh: Supervisor John Doe / phone number
     notified_telegram = Column(Boolean, default=False, nullable=False, index=True)
+    # Snapshot of schedule context at the time of the alert
+    schedule_work_hours = Column(String)
+    schedule_lunch_break = Column(String)
+    schedule_is_manual_pause = Column(Boolean, default=False)
+    schedule_tracking_active = Column(Boolean, default=False)
 
     employee = relationship("Employee", back_populates="alert_logs")
     camera = relationship("Camera")
@@ -203,6 +208,16 @@ def init_db() -> None:
             if 'camera_id' not in cols_alerts:
                 conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN camera_id INTEGER")
                 print("[DB Migration] Added column alert_logs.camera_id")
+            
+            # 4. Add schedule context columns to alert_logs (if needed)
+            if 'schedule_work_hours' not in cols_alerts:
+                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN schedule_work_hours VARCHAR")
+            if 'schedule_lunch_break' not in cols_alerts:
+                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN schedule_lunch_break VARCHAR")
+            if 'schedule_is_manual_pause' not in cols_alerts:
+                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN schedule_is_manual_pause BOOLEAN DEFAULT 0")
+            if 'schedule_tracking_active' not in cols_alerts:
+                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN schedule_tracking_active BOOLEAN DEFAULT 0")
     except Exception:
         pass
     print(f"Database initialized ({DB_FILE})")

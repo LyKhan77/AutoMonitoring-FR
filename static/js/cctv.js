@@ -58,15 +58,16 @@
       const empId = String(log && log.employee_id || '');
       if (!msg) return; // require message from server (already correct text)
       const lower = msg.toLowerCase();
-      if (lower.includes('back to area') || lower.includes('out of area since')) {
-      try{
-        const NC = (window.App && window.App.NotificationCenter) ? window.App.NotificationCenter : null;
-        if (NC){
-          NC.pushKeyed(`alert:${empId}:${typ}:${log.timestamp||Date.now()}`, msg, 45000); }
-      }catch(_){ }
-      try{
-        if (elAlerts){ const n = parseInt(elAlerts.textContent||'0',10); elAlerts.textContent = String((isFinite(n)?n:0)+1); }
-      }catch(_){ }
+      if (canAlert() && (lower.includes('back to area') || lower.includes('out of area since'))) {
+        try{
+          const NC = (window.App && window.App.NotificationCenter) ? window.App.NotificationCenter : null;
+          if (NC){
+            NC.pushKeyed(`alert:${empId}:${typ}:${log.timestamp||Date.now()}`, msg, 45000);
+          }
+        }catch(_){ }
+        try{
+          if (elAlerts){ const n = parseInt(elAlerts.textContent||'0',10); elAlerts.textContent = String((isFinite(n)?n:0)+1); }
+        }catch(_){ }
       }
     });
   }catch(_e){ }
@@ -515,7 +516,12 @@
     catch(_){ /* ignore */ }
   }
   pollScheduleState(); setInterval(pollScheduleState, 20000);
-  function canAlert(){ const st = (window.App && App.ScheduleState) ? App.ScheduleState : null; return !(st && st.suppress_alerts); }
+  function canAlert(){
+    const st = (window.App && App.ScheduleState) ? App.ScheduleState : null;
+    if (!st) return true; // Default to allowing alerts if state is not yet loaded
+    // Alert only if tracking is active AND alerts are not suppressed (e.g., by lunch break)
+    return st.tracking_active && !st.suppress_alerts;
+  }
   // Cameras Online badge updater
   async function updateCamerasOnline(){
     try{

@@ -57,12 +57,17 @@ class AlertLog(Base):
     message = Column(String)
     alert_type = Column(String)
     notified_telegram = Column(Boolean, default=False, index=True)
+    schedule_work_hours = Column(String)
+    schedule_lunch_break = Column(String)
+    schedule_is_manual_pause = Column(Boolean)
+    schedule_tracking_active = Column(Boolean)
     employee = relationship("Employee", lazy="joined")
     camera = relationship("Camera")
 
 # --- Internal State ---
 _tg_cfg: Dict[str, Any] = {}
 _first_start_processed = False # Flag to ensure old alerts are flushed only once
+_last_known_schedule_status: Optional[str] = None # Tracks 'work_hours', 'lunch_break', 'off_hours'
 _conversation_state: Dict[int, Dict[str, Any]] = {} # {chat_id: {state: 'awaiting_date', data: {}}}
 _bot_active_chats = set() # Menyimpan chat_id yang sudah mengaktifkan bot
 _last_update_id = 0
@@ -77,6 +82,31 @@ def load_tg_config() -> Dict[str, Any]:
         print(f"[Error] Could not load config/config_telegram.json: {e}")
         _tg_cfg = {}
     return _tg_cfg
+
+_schedule_state_cache = {}
+def _get_live_schedule_state() -> Dict[str, Any]:
+    """Fetches the live schedule state from the main app's API."""
+    global _schedule_state_cache
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:5000/api/schedule/state', timeout=2.0) as resp:
+            _schedule_state_cache = json.loads(resp.read().decode())
+            return _schedule_state_cache
+    except Exception:
+        # On failure, return last known good state or a default
+        return _schedule_state_cache or {'tracking_active': True, 'suppress_alerts': False}
+
+def _is_alertable_time(ts_utc: dt.datetime) -> bool:
+    """Checks if a UTC timestamp falls within the alertable work schedule (WIB)."""
+    try:
+        # Instead of reading a static file, get the live state from the app.
+        # This respects manual pauses and auto-schedule toggles.
+        schedule_state = _get_live_schedule_state()
+        is_tracking_active = schedule_state.get('tracking_active', True)
+        are_alerts_suppressed = schedule_state.get('suppress_alerts', False)
+        # An alert should only be sent if tracking is active AND alerts are not suppressed.
+        return is_tracking_active and not are_alerts_suppressed
+    except Exception:
+        return True # Default to true if schedule parsing fails
 
 def send_telegram_message(chat_id: str, message: str, bot_token: str, reply_markup: Optional[Dict] = None) -> bool:
     """Sends a message to a specific Telegram chat."""
@@ -205,8 +235,8 @@ def send_attendance_preview(chat_id: int, emp_id: int, date_str: str, bot_token:
         wib_tz = dt.timezone(dt.timedelta(hours=7))
         ts_wib = ts_utc.astimezone(wib_tz)
         ts = ts_wib.strftime('%H:%M:%S')
-        cam = f"{first_in_data.get('cam_name', '')} - {first_in_data.get('cam_area', '')}"
-        caption = f"🟢 <b>First In</b> \n🕒: {ts} \n📸: {cam}"
+        cam_str = f"{first_in_data.get('cam_name', '')} - {first_in_data.get('cam_area', '')}"
+        caption = f"🟢 <b>First In</b>\nTimestamp: {ts}\nCamera: {cam_str}"
         img_path = os.path.join(capture_dir, first_in_data['file'])
         if os.path.isfile(img_path):
             send_telegram_photo(chat_id, img_path, caption, bot_token)
@@ -221,8 +251,8 @@ def send_attendance_preview(chat_id: int, emp_id: int, date_str: str, bot_token:
         wib_tz = dt.timezone(dt.timedelta(hours=7))
         ts_wib = ts_utc.astimezone(wib_tz)
         ts = ts_wib.strftime('%H:%M:%S')
-        cam = f"{last_out_data.get('cam_name', '')} - {last_out_data.get('cam_area', '')}"
-        caption = f"🔴 <b>Last Out</b> \n🕒: {ts} \n📸: {cam}"
+        cam_str = f"{last_out_data.get('cam_name', '')} - {last_out_data.get('cam_area', '')}"
+        caption = f"🔴 <b>Last Out</b>\nTimestamp: {ts}\nCamera: {cam_str}"
         img_path = os.path.join(capture_dir, last_out_data['file'])
         if os.path.isfile(img_path):
             send_telegram_photo(chat_id, img_path, caption, bot_token)
@@ -269,7 +299,7 @@ def process_updates(bot_token: str):
 
                 print(f"Bot activated in chat ID: {chat_id}")
                 _bot_active_chats.add(chat_id)
-                response_message = "Haloo..👋🏼 \nGSPE Monitoring Bot sudah aktif dan siap memantau laporan."
+                response_message = "Haloo..👋🏼\nGSPE Monitoring Bot sudah aktif dan siap memantau laporan."
                 send_telegram_message(chat_id, response_message, bot_token)
         elif command.startswith('/stop'):
             if chat_id in _bot_active_chats:
@@ -278,6 +308,20 @@ def process_updates(bot_token: str):
                 _bot_active_chats.discard(chat_id)
                 response_message = "Bot telah di-Jeda ⏳"
                 send_telegram_message(chat_id, response_message, bot_token)
+        elif command.startswith('/status'):
+            try:
+                state = _get_live_schedule_state()
+                status_str = _get_status_string(state)
+                status_map = {
+                    'work_hours': 'Work Hours',
+                    'lunch_break': 'Lunch Break',
+                    'off_hours': 'Off Hours'
+                }
+                display_status = status_map.get(status_str, 'Unknown')
+                response_message = f"Status schedule system saat ini sedang <b>{display_status}</b>."
+                send_telegram_message(chat_id, response_message, bot_token)
+            except Exception as e:
+                print(f"[Status Command] Error: {e}")
         elif command.startswith('/attendance'):
             # Start the attendance report flow
             _conversation_state[chat_id] = {'state': 'awaiting_date', 'data': {}}
@@ -345,22 +389,24 @@ def poll_and_send_alerts(bot_token: str):
             if log.alert_type == 'ENTER':
                 # Pesan asli: "John Doe back to area after 5 min"
                 # Kita ambil bagian "after 5 min"
-                try:
-                    duration_part = log.message.split('back to area', 1)[-1].strip()
-                except (AttributeError, IndexError):
-                    duration_part = ""
-                tg_msg = f"🟢 <b>ENTER:</b> {emp_code} - {emp_name} back to area {duration_part}\n<b>Department:</b> {dept}\n<b>Camera:</b> {cam_str}\n<b>Date:</b> {date_part}\n<b>Time:</b> {time_part} WIB"
+                duration_part = ""
+                if log.message:
+                    try: duration_part = log.message.split('back to area', 1)[-1].strip()
+                    except Exception: pass
+                tg_msg = f"=== ALERT ===\n🟢 <b>ENTER:</b> {emp_code} - {emp_name} back to area {duration_part}\n\n<b>Department:</b> {dept}\n<b>Camera:</b> {cam_str}\n<b>Date:</b> {date_part}\n<b>Time:</b> {time_part} WIB"
             else: # EXIT
-                try:
-                    duration_part = log.message.split('out of area', 1)[-1].strip()
-                except (AttributeError, IndexError):
-                    duration_part = ""
-                tg_msg = f"🔴 <b>EXIT:</b> {emp_code} - {emp_name} out of area {duration_part}\n<b>Department:</b> {dept}\n<b>Camera:</b> {cam_str}\n<b>Date:</b> {date_part}\n<b>Time:</b> {time_part} WIB"
+                duration_part = ""
+                if log.message:
+                    try: duration_part = log.message.split('out of area', 1)[-1].strip()
+                    except Exception: pass
+                tg_msg = f"=== ALERT ===\n🔴 <b>EXIT:</b> {emp_code} - {emp_name} out of area {duration_part}\n\n<b>Department:</b> {dept}\n<b>Camera:</b> {cam_str}\n<b>Date:</b> {date_part}\n<b>Time:</b> {time_part} WIB"
             
             # Kirim ke semua chat yang aktif
-            for chat_id in list(_bot_active_chats):
-                send_telegram_message(chat_id, tg_msg, bot_token)
-                time.sleep(0.1) # Jeda kecil antar pengiriman
+            # --- Alert Smartly Logic ---
+            if _is_alertable_time(log.timestamp):
+                for chat_id in list(_bot_active_chats):
+                    send_telegram_message(chat_id, tg_msg, bot_token)
+                    time.sleep(0.1) # Jeda kecil antar pengiriman
             
             # Tandai sebagai sudah terkirim
             log.notified_telegram = True
@@ -415,5 +461,63 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping Telegram Bot.")
 
+def _get_status_string(state: Dict[str, Any]) -> str:
+    """Determines a simple status string from the schedule state object."""
+    if not state.get('tracking_active', False):
+        return 'off_hours'
+    if state.get('suppress_alerts', False):
+        return 'lunch_break'
+    return 'work_hours'
+
+def schedule_monitor_thread(bot_token: str):
+    """Periodically checks for schedule status changes and notifies active chats."""
+    global _last_known_schedule_status
+    print("[Schedule Monitor] Started.")
+    
+    # On first run, just set the initial state without notifying
+    try:
+        initial_state = _get_live_schedule_state()
+        _last_known_schedule_status = _get_status_string(initial_state)
+        print(f"[Schedule Monitor] Initial status is '{_last_known_schedule_status}'")
+    except Exception:
+        pass
+
+    while True:
+        # Check every 5 seconds for better responsiveness to manual actions
+        time.sleep(5)
+        try:
+            current_state = _get_live_schedule_state()
+            if not current_state: # Skip if API is down
+                continue
+
+            current_status = _get_status_string(current_state)
+
+            if current_status != _last_known_schedule_status:
+                print(f"[Schedule Monitor] Status changed from '{_last_known_schedule_status}' to '{current_status}'. Notifying...")
+                message = ""
+                if current_status == 'lunch_break':
+                    message = "=== Status Update ===\nSchedule system sedang <b>Lunch Break</b> 🍽 \n\nSelamat makan siang.."
+                elif current_status == 'off_hours':
+                    message = "=== Status Update ===\nSchedule system sedang <b>Off Hours</b> 🌙 \n\nSampai jumpa.."
+                elif current_status == 'work_hours':
+                    message = "=== Status Update ===\nSchedule system sedang <b>Work Hours</b> 💼 \n\nSaatnya kembali bekerja.."
+                
+                if message:
+                    for chat_id in list(_bot_active_chats):
+                        send_telegram_message(chat_id, message, bot_token)
+                
+                _last_known_schedule_status = current_status
+        except Exception as e:
+            print(f"[Schedule Monitor] Error: {e}")
+
 if __name__ == '__main__':
+    # Load config once at the start
+    config = load_tg_config()
+    bot_token = config.get('bot_token')
+    if bot_token and bot_token != 'YOUR_TELEGRAM_BOT_TOKEN':
+        # Start the schedule monitor thread alongside the others
+        schedule_monitor = threading.Thread(target=schedule_monitor_thread, args=(bot_token,), daemon=True)
+        schedule_monitor.start()
+    
+    # Call the main function which handles other threads and the main loop
     main()

@@ -30,7 +30,10 @@
 
   const App = window.App || (window.App = {});
   const NotificationCenter = (function(){
-    const state = { history: [], unread: 0, lastKeys: new Map(), recentMsgs: new Set(), shownCount: 10 };
+    // Initialize shownCount with param value if available, otherwise default to 10.
+    const initialLimit = (App.Params && App.Params.notification_limit) ? Number(App.Params.notification_limit) : 10;
+    const state = { history: [], unread: 0, lastKeys: new Map(), recentMsgs: new Set(), shownCount: initialLimit };
+
     const STORAGE_KEY = 'notif_history_v1';
     const STORAGE_LAST_KEYS = 'notif_last_keys_v1';
     function loadHistory(){

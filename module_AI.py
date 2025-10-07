@@ -761,35 +761,7 @@ class TrackingManager:
                                 if att is None:
                                     att = Attendance(employee_id=emp_id, date=today, last_out_ts=now, status='PRESENT')
                                     db.add(att)
-                                else:
-                                    att.last_out_ts = now
-                            # If already >=60s absent at this moment, log alert once
-                            if secs is not None and secs >= 60 and _alerts_allowed():
-                                try:
-                                    # Client-side handles EXIT Alert Logs to prevent duplicates.
-                                    # Intentionally skip server-side INSERT here.
-                                    _ = db.query(AlertLog).filter(
-                                        AlertLog.employee_id == emp_id,
-                                        AlertLog.alert_type == 'EXIT',
-                                        AlertLog.timestamp >= (pres.last_seen_ts or now - dt.timedelta(days=1))
-                                    ).first()
-                                    # no-op
-                                except Exception:
-                                    pass
                         else:
-                            # Already off: if just crossed 60s and no alert yet for this absence, log once
-                            if secs is not None and secs >= 60 and _alerts_allowed():
-                                try:
-                                    # Client-side handles EXIT Alert Logs to prevent duplicates.
-                                    # Intentionally skip server-side INSERT here.
-                                    _ = db.query(AlertLog).filter(
-                                        AlertLog.employee_id == emp_id,
-                                        AlertLog.alert_type == 'EXIT',
-                                        AlertLog.timestamp >= (pres.last_seen_ts or now - dt.timedelta(days=1))
-                                    ).first()
-                                    # no-op
-                                except Exception:
-                                    pass
                             # Ensure inactive employees keep ABSENT status for today
                             try:
                                 emp_row = db.query(Employee).filter(Employee.id == emp_id).first()
