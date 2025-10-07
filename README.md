@@ -7,11 +7,8 @@ It combines face recognition, CCTV stream analysis, and intelligent scheduling t
 
 ## 🔍 Overview
 
-<<<<<<< HEAD
 The Auto-Monitoring System processes live RTSP CCTV streams, recognizes employees using deep-learning models (`insightface` + `onnxruntime-gpu`), and automatically records `First In`/`Last Out` times.  
-=======
 The GSPE Auto-Monitoring System processes live RTSP CCTV streams, recognizes employees using deep-learning models (`insightface` + `onnxruntime-gpu`), and automatically records `First In`/`Last Out` times.  
->>>>>>> 6159d0070326003317a395587b8c2d61c8f700ec
 It enforces work-hour policies, generates violation alerts, and supports both **automatic** and **manual** schedule modes.  
 Users can monitor the system through a **web dashboard** or receive updates via a **Telegram bot**.
 
