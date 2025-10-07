@@ -202,11 +202,11 @@ Most runtime parameters are in `config/parameter_config.json`. Important keys:
 4. Check notifications for alerts
 
 ### Report: Reset Logs
-1. Buka halaman Report pada dashboard.
-2. Klik tombol "Reset Logs".
-3. Pilih tabel (Both / Events only / Alert Logs only).
-4. Opsional: pilih From dan To Date (YYYY-MM-DD). Kosongkan untuk hapus semua.
-5. Konfirmasi. Sistem akan menampilkan jumlah baris yang terhapus.
+1. Open the Report page on the dashboard.
+2. Click the “Reset Logs” button.
+3. Select the table (Both / Events only / Alert Logs only).
+4. Optional: select From and To Date (YYYY-MM-DD). Leave blank to delete all.
+5. Confirm. The system will display the number of rows deleted.
 
 ### Attendance Captures Report
 - Endpoint: `GET /api/report/attendance_captures?employee_id=ID&date=YYYY-MM-DD`
@@ -337,18 +337,16 @@ Monitor console output for:
 ### Project Structure
 ```
 FR-V3/
-├── app.py                      # Main Flask application
+├── app.py                     # Main Flask application
 ├── module_AI.py               # AI/Face recognition engine
+├── telegram.py                # Telegram bot integration
 ├── database_models.py         # Database models and ORM (+light migrations)
 ├── requirements.txt           # Python dependencies
 ├── config/
 │   ├── parameter_config.json  # Runtime parameters (AI/RTSP/Attendance)
-│   └── config_whatsapp.json   # WhatsApp config (no secrets/tokens)
-├── helpers/
-│   └── whatsapp.py            # Async WhatsApp sender (Meta Cloud API)
-├── scripts/
-│   └── import_employees.py    # Upsert employees from data-karyawan.json
-├── static/                    # JS/CSS assets (incl. notifications.js)
+│   ├── tracking_mode.json     # Tracking / Schedule system configuration
+│   └── config_telegram.json   # Telegram Config
+├── static/                    # JS/CSS assets
 ├── templates/                 # HTML templates
 ├── camera_configs/            # Camera JSON configs (per CAM folder)
 ├── captures/                  # Rolling per-camera snapshots (runtime)
