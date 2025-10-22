@@ -51,25 +51,32 @@
 
   // Real-time alert logs -> on-time notifications (message-based only) with de-dup
   try{
-    socket.on('alert_log', (log)=>{
-      // Only accept canonical message forms. The server is the source of truth.
-      const msg = (log && typeof log.message === 'string') ? log.message : '';
-      const typ = String(log && log.alert_type || '').toUpperCase();
-      const empId = String(log && log.employee_id || '');
-      if (!msg) return; // require message from server (already correct text)
-      const lower = msg.toLowerCase();
-      if (canAlert() && (lower.includes('back to area') || lower.includes('out of area since'))) {
-        try{
-          const NC = (window.App && window.App.NotificationCenter) ? window.App.NotificationCenter : null;
-          if (NC){
-            NC.pushKeyed(`alert:${empId}:${typ}:${log.timestamp||Date.now()}`, msg, 45000);
+      socket.on('alert_log', (log) => {
+          if (!log || !log.message || !log.alert_type) return;
+
+          const msg = log.message;
+          const typ = String(log.alert_type || '').toUpperCase();
+          const empId = String(log.employee_id || '');
+          const ts = log.timestamp || Date.now();
+
+          // Use a unique key to prevent duplicate notifications from server retries
+          const key = `alert:${empId}:${typ}:${ts}`;
+
+          // Check if alerts are allowed by the schedule
+          if (canAlert()) {
+              const NC = (window.App && window.App.NotificationCenter) ? window.App.NotificationCenter : null;
+              if (NC) {
+                  // The message from the server is already formatted correctly for each type.
+                  NC.pushKeyed(key, msg, 45000);
+              }
+
+              // Increment alert count for non-new-employee alerts
+              if (typ !== 'NEW EMPLOYEE' && elAlerts) {
+                  const n = parseInt(elAlerts.textContent || '0', 10);
+                  elAlerts.textContent = String((isFinite(n) ? n : 0) + 1);
+              }
           }
-        }catch(_){ }
-        try{
-          if (elAlerts){ const n = parseInt(elAlerts.textContent||'0',10); elAlerts.textContent = String((isFinite(n)?n:0)+1); }
-        }catch(_){ }
-      }
-    });
+      });
   }catch(_e){ }
 
   function setAIStatus(active) {
@@ -645,6 +652,14 @@
           <div class="text-sm">${camName}</div>
           <div class="text-xs text-gray-500">${durationText(item)}</div>
         </div>`;
+      
+      // Visual effect for new employee detection
+      if (item.is_present && item.seconds_since < 5) {
+          const prev = prevByEmp.get(item.employee_id);
+          if (!prev) { // First time seeing this employee in this session
+              card.style.animation = 'flash-green 1.5s ease-out';
+          }
+      }
       elEmpList.appendChild(card);
     });
   }

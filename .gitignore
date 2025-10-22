@@ -39,3 +39,6 @@ face_images/
 
 # Dedicated cache folder
 _tensorrt_cache/
+
+# Doc
+*.md

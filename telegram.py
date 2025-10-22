@@ -42,6 +42,13 @@ class Camera(Base):
     name = Column(String)
     area = Column(String)
 
+class FaceTemplate(Base):
+    __tablename__ = 'face_templates'
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(Integer, ForeignKey('employees.id'))
+    pose_label = Column(String)
+    # We only need these columns for finding the image path
+
 class Attendance(Base):
     __tablename__ = 'attendances'
     id = Column(Integer, primary_key=True)
@@ -71,6 +78,18 @@ _last_known_schedule_status: Optional[str] = None # Tracks 'work_hours', 'lunch_
 _conversation_state: Dict[int, Dict[str, Any]] = {} # {chat_id: {state: 'awaiting_date', data: {}}}
 _bot_active_chats = set() # Menyimpan chat_id yang sudah mengaktifkan bot
 _last_update_id = 0
+
+def _safe_name(name: Optional[str]) -> str:
+    """Replicates the safe name logic from app.py for directory naming."""
+    try:
+        s = (name or '').strip()
+        if not s:
+            return 'unknown'
+        cleaned = ''.join(ch for ch in s if ch.isalnum() or ch in (' ', '-', '_'))
+        cleaned = '_'.join(part for part in cleaned.split())
+        return cleaned[:64]
+    except Exception:
+        return 'unknown'
 
 def load_tg_config() -> Dict[str, Any]:
     """Loads the Telegram configuration from JSON file."""
@@ -394,19 +413,43 @@ def poll_and_send_alerts(bot_token: str):
                     try: duration_part = log.message.split('back to area', 1)[-1].strip()
                     except Exception: pass
                 tg_msg = f"=== ALERT ===\n🟢 <b>ENTER:</b> {emp_code} - {emp_name} back to area {duration_part}\n\n<b>Department:</b> {dept}\n<b>Camera:</b> {cam_str}\n<b>Date:</b> {date_part}\n<b>Time:</b> {time_part} WIB"
+            elif log.alert_type == 'New Employee':
+                # Build the text message first
+                caption = f"=== ALERT ===\nNew employee has entered the area. Welcome {emp_code} - {emp_name}\n\n<b>Department:</b> {dept}\n<b>Camera:</b> {cam_str}\n<b>Date:</b> {date_part}\n<b>Time:</b> {time_part} WIB"
+                
+                # Try to find and send a photo
+                photo_sent = False
+                try:
+                    # Find the 'front' pose template for this employee
+                    front_template = db.query(FaceTemplate).filter(
+                        FaceTemplate.employee_id == log.employee_id,
+                        FaceTemplate.pose_label == 'front'
+                    ).order_by(FaceTemplate.id.desc()).first()
+
+                    if front_template and emp:
+                        img_dir = os.path.join(BASE_DIR, 'face_images', _safe_name(emp.name))
+                        photo_path = os.path.join(img_dir, f"{front_template.id}.jpg")
+                        if os.path.isfile(photo_path):
+                            for chat_id in list(_bot_active_chats):
+                                send_telegram_photo(chat_id, photo_path, caption, bot_token)
+                            photo_sent = True
+                except Exception as e:
+                    print(f"[Telegram] Error finding photo for new employee: {e}")
+                tg_msg = caption if not photo_sent else None # Set msg to None if photo was sent
             else: # EXIT
                 duration_part = ""
                 if log.message:
                     try: duration_part = log.message.split('out of area', 1)[-1].strip()
                     except Exception: pass
                 tg_msg = f"=== ALERT ===\n🔴 <b>EXIT:</b> {emp_code} - {emp_name} out of area {duration_part}\n\n<b>Department:</b> {dept}\n<b>Camera:</b> {cam_str}\n<b>Date:</b> {date_part}\n<b>Time:</b> {time_part} WIB"
-            
+
             # Kirim ke semua chat yang aktif
             # --- Alert Smartly Logic ---
-            if _is_alertable_time(log.timestamp):
-                for chat_id in list(_bot_active_chats):
-                    send_telegram_message(chat_id, tg_msg, bot_token)
-                    time.sleep(0.1) # Jeda kecil antar pengiriman
+            if tg_msg: # Only send text message if tg_msg is not None
+                if _is_alertable_time(log.timestamp):
+                    for chat_id in list(_bot_active_chats):
+                        send_telegram_message(chat_id, tg_msg, bot_token)
+                        time.sleep(0.1) # Jeda kecil antar pengiriman
             
             # Tandai sebagai sudah terkirim
             log.notified_telegram = True

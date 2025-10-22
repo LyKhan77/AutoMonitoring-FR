@@ -200,13 +200,17 @@ def _get_face_app():
             pass
         # Try with configured providers first, then fallback to defaults
         try:
+            # Tentukan ctx_id=0 (GPU) hanya jika provider GPU/TensorRT ada.
+            ctx = 0 if any('CUDA' in p or 'Tensorrt' in p for p in providers) else -1
+            
             _face_app = FaceAnalysis(name='buffalo_l', providers=providers)
-            _face_app.prepare(ctx_id=0, det_size=det_size)
+            _face_app.prepare(ctx_id=ctx, det_size=det_size) # Menggunakan ctx yang sudah ditentukan
             return _face_app
         except Exception as e1:
             print(f"FaceAnalysis init with providers {providers} failed: {e1}. Retrying with default providers...")
+            # Saat fallback, pastikan tidak ada panggilan ke GPU
             _face_app = FaceAnalysis(name='buffalo_l')
-            _face_app.prepare(ctx_id=0, det_size=det_size)
+            _face_app.prepare(ctx_id=-1, det_size=det_size) # Gunakan ctx_id=-1 (CPU)
             return _face_app
     except Exception as e:
         print(f"Failed to init FaceAnalysis: {e}")
@@ -756,7 +760,7 @@ def _nearest_capture_for(cam_id: int, target_ts: dt.datetime, max_delta_sec: int
     except Exception:
         return ''
 
-def _save_attendance_capture(emp_id: int, cam_id: int, ts: dt.datetime, kind: str, meta: Dict[str, Any]):
+def _save_attendance_capture(emp_id: int, cam_id: int, ts: dt.datetime, kind: str, meta: Dict[str, Any], overwrite: bool = False):
     """Save attendance capture image and meta under attendance_captures/YYYY-MM-DD/<emp_id>/.
     kind: 'first_in' or 'last_out'
     """
@@ -764,12 +768,12 @@ def _save_attendance_capture(emp_id: int, cam_id: int, ts: dt.datetime, kind: st
         day = (ts.date() if isinstance(ts, dt.datetime) else dt.date.today()).isoformat()
         root = os.path.join(ATT_CAPTURES_DIR, day, str(int(emp_id)))
         os.makedirs(root, exist_ok=True)
-        # Strict write-once guarantee for FIRST IN: if file already exists, do not overwrite
-        if kind == 'first_in':
+        # Strict write-once guarantee for FIRST IN unless overwrite is forced
+        if kind == 'first_in' and not overwrite:
             try:
                 if os.path.isfile(os.path.join(root, 'first_in.jpg')):
                     try:
-                        app.logger.info(f"[attendance] skip first_in: already exists for emp={emp_id} day={day}")
+                        print(f"[attendance] skip first_in: already exists for emp={emp_id} day={day}")
                     except Exception:
                         pass
                     return
@@ -786,7 +790,7 @@ def _save_attendance_capture(emp_id: int, cam_id: int, ts: dt.datetime, kind: st
         with open(target_path, 'wb') as f:
             f.write(img)
         try:
-            app.logger.info(f"[attendance] saved {kind}: emp={emp_id} cam={cam_id} day={day} file={target_path}")
+            print(f"[attendance] saved {kind}: emp={emp_id} cam={cam_id} day={day} file={target_path}")
         except Exception:
             pass
         # Write meta.json
@@ -1645,6 +1649,52 @@ def api_alert_logs_create():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def _handle_new_employee_seen(emp_id: int, cam_id: int, ts: dt.datetime):
+    """
+    Handles the special event when a newly registered employee is detected for the first time.
+    This function is called from module_AI.
+    """
+    try:
+        with SessionLocal() as db:
+            emp = db.get(Employee, int(emp_id))
+            if not emp:
+                return
+
+            # 1. Create a specific AlertLog for this event
+            alert_type = 'New Employee'
+            message = f"(New Employee) {emp.name} has entered the area"
+            
+            # Snapshot current schedule state
+            _maybe_update_tracking_state()
+            
+            new_alert = AlertLog(
+                employee_id=emp_id,
+                camera_id=cam_id,
+                timestamp=ts,
+                alert_type=alert_type,
+                message=message,
+                schedule_work_hours=_tracking_state.get('work_hours'),
+                schedule_lunch_break=_tracking_state.get('lunch_break'),
+                schedule_is_manual_pause=bool(_tracking_state.get('pause_until')),
+                schedule_tracking_active=bool(_tracking_state.get('tracking_active')),
+            )
+            db.add(new_alert)
+            db.commit()
+
+            # 2. Immediately trigger "First In" attendance capture
+            cams_meta = load_cameras()
+            meta = cams_meta.get(int(cam_id), {})
+            # Force overwrite to ensure the first detection is captured, even if a placeholder existed
+            _save_attendance_capture(emp_id, cam_id, ts, 'first_in', meta, overwrite=True)
+
+            # 3. Emit a socket event to notify the web UI
+            socketio.emit('alert_log', {
+                'employee_id': emp_id, 'alert_type': alert_type, 'message': message,
+                'timestamp': _to_iso_utc(ts), 'employee_name': emp.name, 'department': emp.department
+            })
+    except Exception as e:
+        print(f"[ERROR] _handle_new_employee_seen failed for emp_id={emp_id}: {e}")
+
 @app.route('/api/employees', methods=['GET'])
 def list_employees():
     """Return list of employees for Manage Employee UI."""
@@ -2384,6 +2434,23 @@ def api_tracking_stop():
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/tracking/reload_embeddings', methods=['POST'])
+def api_tracking_reload_embeddings():
+    """Forces the AI manager to reload face embeddings from the database."""
+    if ai_manager is None:
+        return jsonify({'error': 'ai_manager_not_available'}), 500
+    try:
+        if hasattr(ai_manager, 'reload_embeddings'):
+            ai_manager.reload_embeddings()
+            return jsonify({'ok': True, 'message': 'Embeddings reload triggered.'})
+        return jsonify({'error': 'reload_not_supported'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Pass the new employee handler to the AI manager instance
+if ai_manager and hasattr(ai_manager, 'set_new_employee_callback'):
+    ai_manager.set_new_employee_callback(_handle_new_employee_seen)
 
 
 @app.route('/api/tracking/state')

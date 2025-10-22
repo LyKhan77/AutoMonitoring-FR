@@ -145,6 +145,17 @@
             100% { transform: rotate(360deg); }
         }
 
+        /* Animation for new employee card flash */
+        @keyframes flash-green {
+            0% { background-color: #e6fffa; border-color: #38a169; }
+            50% { background-color: #e6fffa; border-color: #38a169; }
+            100% { background-color: transparent; border-color: transparent; }
+        }
+        .flash-green {
+            animation: flash-green 1.5s ease-out;
+        }
+
+
         /* From Uiverse.io by namecho */
         .switch { --button-width: 3em; --button-height: 1.5em; --toggle-diameter: 1em; --button-toggle-offset: calc((var(--button-height) - var(--toggle-diameter)) / 2); --toggle-shadow-offset: 10px; --toggle-wider: 2em; --color-grey: #cccccc; --color-green: #11b63a; cursor: pointer; }
         .slider { display: inline-block; width: var(--button-width); height: var(--button-height); background-color: var(--color-grey); border-radius: calc(var(--button-height) / 2); position: relative; transition: 0.3s all ease-in-out; }

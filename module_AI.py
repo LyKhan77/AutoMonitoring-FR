@@ -121,18 +121,29 @@ class FaceEngine:
             for prov in tiers:
                 try:
                     attempted.append(prov)
+                    
+                    # Tentukan ctx_id=0 (GPU) hanya jika provider GPU/TensorRT ada.
+                    # Jika hanya CPU, gunakan ctx_id=-1.
+                    ctx = 0 if any('CUDA' in p or 'Tensorrt' in p for p in prov) else -1
+
+                    from insightface.app import FaceAnalysis
                     self.app = FaceAnalysis(name='buffalo_l', providers=prov)
-                    self.app.prepare(ctx_id=0, det_size=self.det_size)
+                    self.app.prepare(ctx_id=ctx, det_size=self.det_size)
                     self.providers = prov  # record the actual providers used
                     break
                 except Exception as e:
                     last_err = e
                     self.app = None
+                    # Hentikan looping jika sudah mencoba CPU, karena tidak ada fallback lain
+                    if 'CPUExecutionProvider' in prov:
+                        break
                     continue
+
             if self.app is None:
-                # final fallback to default FaceAnalysis which may pick CPU
+                from insightface.app import FaceAnalysis
                 self.app = FaceAnalysis(name='buffalo_l')
-                self.app.prepare(ctx_id=0, det_size=self.det_size)
+                # Gunakan ctx_id=-1 untuk memastikan CPU
+                self.app.prepare(ctx_id=-1, det_size=self.det_size)
                 self.providers = ['CPUExecutionProvider']
             # warmup to initialize kernels if any
             try:
@@ -279,6 +290,10 @@ class TrackingManager:
         self._last_event_ts: Dict[Tuple[int,int], dt.datetime] = {}
         # last alert timestamp per (emp_id, alert_type)
         self._last_alert_ts: Dict[Tuple[int,str], dt.datetime] = {}
+        # Callback for special events (e.g., new employee seen)
+        self._on_new_employee_seen_callback = None
+        # Debounce for new employee welcome alerts (per day)
+        self._welcomed_today: set[int] = set()
 
     # ---- Simple Track structure ----
     class Track:
@@ -704,6 +719,20 @@ class TrackingManager:
                 # Attendance upsert (today)
                 today = ts.date()
                 att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
+
+                # --- New Employee Detection ---
+                # Check if this is the very first attendance record ever for this employee
+                is_new_employee = False
+                if emp_id not in self._welcomed_today:
+                    # Query for any attendance record in the past
+                    any_attendance = db.query(Attendance.id).filter(Attendance.employee_id == emp_id).limit(1).first()
+                    if any_attendance is None:
+                        is_new_employee = True
+                        self._welcomed_today.add(emp_id) # Debounce for today
+                        # Trigger the special handler
+                        self._handle_new_employee_seen(emp_id, cam_id, ts)
+                # --- End New Employee Detection ---
+
                 if att is None:
                     att = Attendance(employee_id=emp_id, date=today, first_in_ts=ts, status='PRESENT')
                     db.add(att)
@@ -719,6 +748,14 @@ class TrackingManager:
         with self._state_lock:
             self.last_seen[emp_id] = ts
             self.last_cam[emp_id] = cam_id
+
+    def set_new_employee_callback(self, callback):
+        """Sets a callback function to be triggered when a new employee is seen for the first time."""
+        self._on_new_employee_seen_callback = callback
+
+    def _handle_new_employee_seen(self, emp_id: int, cam_id: int, ts: dt.datetime):
+        if self._on_new_employee_seen_callback:
+            self._on_new_employee_seen_callback(emp_id, cam_id, ts)
 
     def _update_timeouts(self, now: dt.datetime):
         cutoff = now - dt.timedelta(seconds=self.track_timeout)
@@ -941,3 +978,8 @@ class TrackingManager:
 
 # Singleton manager
 ai_manager = TrackingManager()
+# Daily reset for the welcome debounce set
+def _reset_welcome_debounce():
+    if hasattr(ai_manager, '_welcomed_today'):
+        ai_manager._welcomed_today.clear()
+threading.Timer(86400, _reset_welcome_debounce).start() # Reset every 24 hours
