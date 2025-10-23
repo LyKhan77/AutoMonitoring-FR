@@ -1,0 +1,213 @@
+# ============================================================================
+# GSPE Auto-Monitoring Face Recognition System - Docker Compose Configuration
+# Optimized for GPU acceleration with NVIDIA Container Toolkit
+# ============================================================================
+
+version: '3.8'
+
+services:
+  fr-webapp:
+    image: gspe-fr:v3.2-cuda12.6
+    container_name: gspe-fr-webapp
+    hostname: gspe-fr-webapp
+
+    # Build configuration
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: 3.10.18
+
+    # Network configuration
+    ports:
+      - "5000:5000"      # Flask web server
+      - "8000:8000"      # Prometheus metrics (optional)
+
+    # GPU configuration (requires NVIDIA Container Toolkit)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1  # Use 1 GPU (change to 'all' for multiple GPUs)
+              capabilities: [gpu]
+
+    # Alternative GPU configuration (legacy syntax, use if above doesn't work)
+    # runtime: nvidia
+    # environment:
+    #   - NVIDIA_VISIBLE_DEVICES=all
+
+    # Environment variables
+    environment:
+      # Timezone
+      - TZ=Asia/Jakarta
+
+      # NVIDIA GPU settings
+      - NVIDIA_VISIBLE_DEVICES=0  # Use GPU 0 (change to 'all' for all GPUs)
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+      # CUDA optimization
+      - CUDA_MODULE_LOADING=LAZY
+      - CUDA_CACHE_MAXSIZE=2147483648  # 2GB CUDA cache
+
+      # TensorRT optimization (critical for performance)
+      - ORT_TENSORRT_ENGINE_CACHE_ENABLE=1
+      - ORT_TENSORRT_CACHE_PATH=/app/_tensorrt_cache
+      - ORT_TENSORRT_FP16_ENABLE=1
+      - ORT_TENSORRT_INT8_ENABLE=0
+      - ORT_TENSORRT_MAX_WORKSPACE_SIZE=2147483648  # 2GB
+
+      # ONNX Runtime optimization
+      - OMP_NUM_THREADS=4
+      - OMP_WAIT_POLICY=PASSIVE
+      - ORT_ENABLE_ALL_OPTIMIZATIONS=1
+
+      # OpenCV optimization
+      - OPENCV_VIDEOIO_PRIORITY_GSTREAMER=1
+
+      # Python optimization
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+
+      # Flask configuration
+      - FLASK_ENV=production
+      - FLASK_DEBUG=0
+
+    # Volume mounts (persistent data)
+    volumes:
+      # Database
+      - ./db:/app/db
+
+      # Live captures (latest frames from cameras)
+      - ./captures:/app/captures
+
+      # Attendance captures (first_in/last_out photos)
+      - ./attendance_captures:/app/attendance_captures
+
+      # Camera configurations
+      - ./camera_configs:/app/camera_configs
+
+      # Application configuration
+      - ./config:/app/config
+
+      # TensorRT engine cache (critical for fast startup)
+      - ./_tensorrt_cache:/app/_tensorrt_cache
+
+      # Registered face images
+      - ./face_images:/app/face_images
+
+      # Optional: Mount logs directory
+      - ./logs:/app/logs
+
+    # Shared memory size (required for GPU operations and multiprocessing)
+    # Increase if you get "Bus error" or "Shared memory full" errors
+    shm_size: '2gb'
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Resource limits (adjust based on your server capacity)
+    # Uncomment and modify if needed
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '8'          # Max 8 CPU cores
+    #       memory: 16G        # Max 16GB RAM
+    #     reservations:
+    #       cpus: '4'          # Min 4 CPU cores
+    #       memory: 8G         # Min 8GB RAM
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/config/params"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s  # Allow 40s for initial startup
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"      # Max log file size
+        max-file: "5"         # Keep 5 log files
+        compress: "true"      # Compress old logs
+
+    # Network mode (use bridge for isolation, host for better performance)
+    network_mode: bridge
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+    # User namespace remapping (optional, for additional security)
+    # userns_mode: "host"
+
+# ============================================================================
+# Optional: Telegram Bot Service (run separately if needed)
+# ============================================================================
+  # telegram-bot:
+  #   image: gspe-fr:v3.2-cuda12.6
+  #   container_name: gspe-telegram-bot
+  #   hostname: gspe-telegram-bot
+  #
+  #   command: ["python3", "telegram.py"]
+  #
+  #   environment:
+  #     - TZ=Asia/Jakarta
+  #     - PYTHONUNBUFFERED=1
+  #
+  #   volumes:
+  #     - ./db:/app/db
+  #     - ./attendance_captures:/app/attendance_captures
+  #     - ./config:/app/config
+  #
+  #   restart: unless-stopped
+  #
+  #   depends_on:
+  #     - fr-webapp
+  #
+  #   network_mode: bridge
+
+# ============================================================================
+# Optional: Monitoring Stack (Prometheus + Grafana)
+# ============================================================================
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: gspe-prometheus
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+  #     - prometheus-data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   restart: unless-stopped
+  #
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: gspe-grafana
+  #   volumes:
+  #     - grafana-data:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - prometheus
+
+# ============================================================================
+# Volumes (for persistent data)
+# ============================================================================
+# volumes:
+#   prometheus-data:
+#   grafana-data:
+
+# ============================================================================
+# Networks (optional custom network configuration)
+# ============================================================================
+# networks:
+#   gspe-network:
+#     driver: bridge
+#     ipam:
+#       config:
+#         - subnet: 172.28.0.0/16

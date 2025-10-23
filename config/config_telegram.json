@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "bot_token": "8233317663:AAG7rn0VBJDVyJbcY_mwTDDbzfhkH6Ymr1o",
+  "chat_ids": [
+    "1171737082"
+  ],
+  "rate_limit_per_min": 20,
+  "dedupe_cooldown_sec": 60
+}

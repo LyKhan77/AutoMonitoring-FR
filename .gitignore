@@ -1,0 +1,44 @@
+# Python virtual environment
+env/
+venv/
+*.venv
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database files
+# The directory structure is fine, but the data file itself should be ignored.
+db/
+*.db
+*.db-journal*
+*.sqlite
+*.sqlite3
+
+# Runtime generated data
+captures/
+attendance_captures/
+
+# Employee face data (for privacy and security)
+face_images/
+
+# Log files
+*.log
+*.jsonl
+
+# OS / Editor specific files
+.DS_Store
+.vscode/
+.idea/
+
+# ONNX Runtime / TensorRT cache files
+*.engine
+*.profile
+
+# Dedicated cache folder
+_tensorrt_cache/
+
+# Doc
+*.md
