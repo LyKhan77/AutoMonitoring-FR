@@ -25,8 +25,7 @@
   const capDelMsg = document.getElementById('cap-del-msg');
   // Adjustment bar controls
   const btnAdjToggleFeed = document.getElementById('btn-adj-toggle-feed');
-  const btnAdjExpandEmp = document.getElementById('btn-adj-expand-emp');
-  const btnAdjMinEmp = document.getElementById('btn-adj-min-emp');
+  const btnAdjToggleEmp = document.getElementById('btn-adj-toggle-emp');
   const btnAdjToggleCap = document.getElementById('btn-adj-toggle-cap');
   const feedSection = document.getElementById('cctv-feed');
   const trackSection = document.getElementById('employee-tracking');
@@ -272,6 +271,8 @@
       cameraButtonsEl.innerHTML = `<div class="text-sm text-danger">Failed to load cameras (${App.safe ? App.safe(msg) : msg})</div>`;
       console.error('Failed to load /api/cameras:', e);
     }
+    // Sync employee height after cameras loaded (CCTV panel size may change)
+    syncEmployeeHeight();
   }
 
   async function updateAIIndicatorFor(camId){
@@ -792,6 +793,30 @@
   }
   let state = (function(){ const saved = _loadLayout(); return saved ? { feedHidden: !!saved.feedHidden, empExpanded: !!saved.empExpanded, capHidden: !!saved.capHidden } : { feedHidden: false, empExpanded: false, capHidden: false }; })();
 
+  // Helper function to sync Employee Tracking height
+  function syncEmployeeHeight(){
+    try{
+      requestAnimationFrame(() => {
+        let targetHeight = 0;
+        if (!state.feedHidden && feedSection){
+          targetHeight = Math.max(targetHeight, feedSection.offsetHeight);
+        }
+        if (!state.capHidden && captureSection){
+          targetHeight = Math.max(targetHeight, captureSection.offsetHeight);
+        }
+        if (trackSection && !state.empExpanded){
+          if (targetHeight > 0){
+            trackSection.style.height = targetHeight + 'px';
+          } else {
+            trackSection.style.height = 'fit-content';
+          }
+        } else if (trackSection){
+          trackSection.style.height = 'fit-content';
+        }
+      });
+    }catch(_e){}
+  }
+
   function applyLayout(animate=true){
     if (!feedSection || !trackSection) return;
     // Add transition classes
@@ -803,7 +828,7 @@
       if (state.capHidden){ captureSection.classList.add('hidden'); }
       else { captureSection.classList.remove('hidden'); }
     }
-    if (btnAdjToggleCap){ btnAdjToggleCap.textContent = state.capHidden ? 'Show Capture Panel' : 'Hide Capture Panel'; }
+    // Note: Capture button icon/text updated in dedicated section below (line ~850)
 
     // Reorder panels to keep Employee at top-right always
     try{
@@ -828,52 +853,67 @@
       }
     }catch(e){ /* noop */ }
 
-    // CCTV feed visibility (left area remains empty when hidden)
+    // CCTV feed visibility - instant show/hide
+    const iconFeed = document.getElementById('icon-feed');
     if (state.feedHidden){
       feedSection.classList.add('hidden');
-      if (btnAdjToggleFeed){ btnAdjToggleFeed.textContent = 'Show CCTV Panel'; }
+      if (btnAdjToggleFeed){ btnAdjToggleFeed.title = 'Show CCTV Panel'; }
+      if (iconFeed){ iconFeed.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line>'; }
     } else {
       feedSection.classList.remove('hidden');
-      if (btnAdjToggleFeed){ btnAdjToggleFeed.textContent = 'Hide CCTV Panel'; }
+      if (btnAdjToggleFeed){ btnAdjToggleFeed.title = 'Hide CCTV Panel'; }
+      if (iconFeed){ iconFeed.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>'; }
     }
-    // Employee layout rules
+
+    // Capture panel visibility - instant show/hide
+    const iconCap = document.getElementById('icon-cap');
+    if (state.capHidden){
+      if (captureSection){ captureSection.classList.add('hidden'); }
+      if (btnAdjToggleCap){ btnAdjToggleCap.title = 'Show Frame Capture Panel'; }
+      if (iconCap){ iconCap.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line>'; }
+    } else {
+      if (captureSection){ captureSection.classList.remove('hidden'); }
+      if (btnAdjToggleCap){ btnAdjToggleCap.title = 'Hide Frame Capture Panel'; }
+      if (iconCap){ iconCap.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>'; }
+    }
+
+    // Employee layout rules - instant expand/minimize
     // - Always keep employee at right (col-start-3) when NOT expanded, regardless of feed/capture visibility
     // - When expanded, span all 3 columns and normal list turns into 3-col grid
+    const iconEmpMaximize = document.getElementById('icon-emp-maximize');
+    const iconEmpMinimize = document.getElementById('icon-emp-minimize');
+
     if (!state.empExpanded){
+      // Minimize state
       trackSection.classList.remove('lg:col-span-3');
       trackSection.classList.add('lg:col-start-3');
       if (elEmpList){ elEmpList.classList.remove('grid','grid-cols-3','gap-3'); }
+
+      // Update button to show "expand" state
+      if (iconEmpMaximize){ iconEmpMaximize.classList.remove('hidden'); }
+      if (iconEmpMinimize){ iconEmpMinimize.classList.add('hidden'); }
+      if (btnAdjToggleEmp){ btnAdjToggleEmp.title = 'Expand Employee Panel'; }
     } else {
+      // Expand state
       trackSection.classList.add('lg:col-span-3');
       trackSection.classList.remove('lg:col-start-3');
       if (elEmpList){ elEmpList.classList.add('grid','grid-cols-3','gap-3'); }
+
+      // Update button to show "minimize" state
+      if (iconEmpMaximize){ iconEmpMaximize.classList.add('hidden'); }
+      if (iconEmpMinimize){ iconEmpMinimize.classList.remove('hidden'); }
+      if (btnAdjToggleEmp){ btnAdjToggleEmp.title = 'Minimize Employee Panel'; }
     }
-    // Buttons enable/disable
-    if (btnAdjExpandEmp){
-      // Expand allowed only when BOTH CCTV and Capture are hidden, and not already expanded
-      const enable = !!state.feedHidden && !!state.capHidden && !state.empExpanded;
-      btnAdjExpandEmp.disabled = !enable;
-      btnAdjExpandEmp.classList.toggle('cursor-not-allowed', !enable);
-      btnAdjExpandEmp.classList.toggle('bg-gray-300', !enable);
-      btnAdjExpandEmp.classList.toggle('text-gray-700', !enable);
-      btnAdjExpandEmp.classList.toggle('bg-white', enable);
-      btnAdjExpandEmp.classList.toggle('border', enable);
-      btnAdjExpandEmp.classList.toggle('border-gray-300', enable);
-      btnAdjExpandEmp.classList.toggle('hover:bg-gray-50', enable);
+
+    // Enable/disable employee toggle button (only when BOTH CCTV and Capture are hidden)
+    if (btnAdjToggleEmp){
+      const canToggleEmp = state.feedHidden && state.capHidden;
+      btnAdjToggleEmp.disabled = !canToggleEmp;
     }
-    if (btnAdjMinEmp){
-      // Minimize allowed only when expanded
-      const enableMin = !!state.empExpanded;
-      btnAdjMinEmp.disabled = !enableMin;
-      btnAdjMinEmp.classList.toggle('cursor-not-allowed', !enableMin);
-      btnAdjMinEmp.classList.toggle('bg-gray-300', !enableMin);
-      btnAdjMinEmp.classList.toggle('text-gray-700', !enableMin);
-      btnAdjMinEmp.classList.toggle('bg-white', enableMin);
-      btnAdjMinEmp.classList.toggle('border', enableMin);
-      btnAdjMinEmp.classList.toggle('border-gray-300', enableMin);
-      btnAdjMinEmp.classList.toggle('hover:bg-gray-50', enableMin);
-      btnAdjMinEmp.textContent = 'Minimize Employee Panel';
-    }
+
+    // Sync Employee Tracking height to match CCTV/Capture panel height
+    syncEmployeeHeight();
+
     // Persist layout after each apply
     _saveLayout(state);
     // Debounced refresh for camera UI if layout changes hide/show panels
@@ -887,10 +927,30 @@
   // Seed saved area filter on first load (in case loadCameras hasn't set it yet)
   try{ const savedArea = localStorage.getItem(LSK_AREA) || ''; if (areaFilter && savedArea) areaFilter.value = savedArea; }catch(_e){}
   // Handlers
-  if (btnAdjToggleFeed){ btnAdjToggleFeed.addEventListener('click', ()=>{ state.feedHidden = !state.feedHidden; if (!state.feedHidden){ state.empExpanded = false; } applyLayout(true); }); }
-  if (btnAdjExpandEmp){ btnAdjExpandEmp.addEventListener('click', ()=>{ if (state.feedHidden && !state.empExpanded){ state.empExpanded = true; applyLayout(true); } }); }
-  if (btnAdjMinEmp){ btnAdjMinEmp.addEventListener('click', ()=>{ if (state.empExpanded){ state.empExpanded = false; applyLayout(true); } }); }
-  if (btnAdjToggleCap){ btnAdjToggleCap.addEventListener('click', ()=>{ state.capHidden = !state.capHidden; applyLayout(true); }); }
+  // Toggle CCTV Panel with animation
+  if (btnAdjToggleFeed){
+    btnAdjToggleFeed.addEventListener('click', ()=>{
+      state.feedHidden = !state.feedHidden;
+      if (!state.feedHidden){ state.empExpanded = false; } // Auto-minimize employee when showing CCTV
+      applyLayout(true);
+    });
+  }
+  // Toggle Capture Panel with animation
+  if (btnAdjToggleCap){
+    btnAdjToggleCap.addEventListener('click', ()=>{
+      state.capHidden = !state.capHidden;
+      applyLayout(true);
+    });
+  }
+  // Toggle Employee Expand/Minimize (single button)
+  if (btnAdjToggleEmp){
+    btnAdjToggleEmp.addEventListener('click', ()=>{
+      if (state.feedHidden && state.capHidden){
+        state.empExpanded = !state.empExpanded; // Toggle between expand and minimize
+        applyLayout(true);
+      }
+    });
+  }
 
   // Cross-tab sync via storage events
   window.addEventListener('storage', (e)=>{
@@ -911,4 +971,8 @@
       }
     }catch(_e){}
   });
+
+  // Sync employee height on window load and resize
+  window.addEventListener('load', ()=>{ syncEmployeeHeight(); });
+  window.addEventListener('resize', ()=>{ syncEmployeeHeight(); });
 })();
