@@ -23,21 +23,21 @@
   const capDelDate = document.getElementById('cap-del-date');
   const btnCapDel = document.getElementById('btn-cap-del');
   const capDelMsg = document.getElementById('cap-del-msg');
-  // Adjustment bar controls
-  const btnAdjToggleFeed = document.getElementById('btn-adj-toggle-feed');
-  const btnAdjToggleEmp = document.getElementById('btn-adj-toggle-emp');
-  const btnAdjToggleCap = document.getElementById('btn-adj-toggle-cap');
+  // System Control Panel - Layout controls
+  const btnAdjToggleFeed = document.getElementById('btn-toggle-feed');
+  const btnAdjToggleEmp = document.getElementById('btn-toggle-emp');
+  const btnAdjToggleCap = document.getElementById('btn-toggle-cap');
   const feedSection = document.getElementById('cctv-feed');
   const trackSection = document.getElementById('employee-tracking');
   const captureSection = document.getElementById('frame-capture');
-  // System info elements
-  const sysLatency = document.getElementById('sys-latency');
-  const sysWifiIcon = document.getElementById('sys-wifi-icon');
-  const sysGpuVal = document.getElementById('sys-gpu-val');
-  const sysMemVal = document.getElementById('sys-mem-val');
-  const btnRefreshPage = document.getElementById('btn-refresh-page');
-  const sysModeText = document.getElementById('sys-mode-text');
-  const sysModeIcon = document.getElementById('sys-mode-icon');
+  // System Control Panel - Status elements
+  const sysLatency = document.getElementById('net-val');
+  const sysWifiIcon = document.getElementById('wifi-icon');
+  const sysGpuVal = document.getElementById('gpu-val');
+  const sysMemVal = document.getElementById('mem-val');
+  const btnRefreshPage = document.getElementById('btn-refresh');
+  const sysModeText = document.getElementById('mode-text');
+  const sysModeIcon = document.getElementById('status-mode');
 
   if (!cameraButtonsEl && !elEmpList) return; // not on CCTV page
 
@@ -105,25 +105,58 @@
       const st = await res.json();
       const active = !!st.tracking_active;
       const lunch = !!st.suppress_alerts;
-      let label = 'Off-Hours';
-      let cls = 'text-gray-500';
+      let label = 'Off Hours';
+      let textCls = 'text-gray-700';
+      let bgCls = 'bg-gray-100';
+      let borderCls = 'border-gray-200';
       let icon = 'off';
-      if (lunch){ label = 'Lunch Break'; cls = 'text-yellow-600'; }
-      else if (active){ label = 'Work Hours'; cls = 'text-green-600'; }
-      icon = lunch ? 'lunch' : (active ? 'work' : 'off');
-      if (sysModeText){ sysModeText.textContent = label; sysModeText.classList.remove('text-gray-500','text-green-600','text-yellow-600','text-red-600'); sysModeText.classList.add(cls); }
+
+      if (lunch){
+        label = 'Lunch Break';
+        textCls = 'text-yellow-700';
+        bgCls = 'bg-yellow-50';
+        borderCls = 'border-yellow-200';
+        icon = 'lunch';
+      }
+      else if (active){
+        label = 'Work Hours';
+        textCls = 'text-green-700';
+        bgCls = 'bg-green-50';
+        borderCls = 'border-green-200';
+        icon = 'work';
+      }
+      else {
+        label = 'Off Hours';
+        textCls = 'text-gray-700';
+        bgCls = 'bg-gray-100';
+        borderCls = 'border-gray-200';
+        icon = 'off';
+      }
+
+      // Update badge text and colors
+      if (sysModeText){
+        sysModeText.textContent = label;
+        sysModeText.classList.remove('text-gray-700','text-green-700','text-yellow-700','text-red-700');
+        sysModeText.classList.add(textCls);
+      }
+
+      // Update badge background and border
       if (sysModeIcon){
-        sysModeIcon.classList.remove('text-gray-500','text-green-600','text-yellow-600','text-red-600');
-        sysModeIcon.classList.add(cls);
-        // swap icon per mode
-        if (icon === 'work'){
-          sysModeIcon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12.8V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h11"/></svg>';
-        } else if (icon === 'lunch'){
-          // pause circle style
-          sysModeIcon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="10" y1="9" x2="10" y2="15"/><line x1="14" y1="9" x2="14" y2="15"/></svg>';
-        } else {
-          // moon icon for off-hours
-          sysModeIcon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+        sysModeIcon.classList.remove('bg-gray-100','bg-green-50','bg-yellow-50','bg-orange-50');
+        sysModeIcon.classList.remove('border-gray-200','border-gray-300','border-green-200','border-yellow-200','border-orange-200');
+        sysModeIcon.classList.add(bgCls, borderCls);
+
+        // Update icon SVG
+        const svg = sysModeIcon.querySelector('svg');
+        if (svg){
+          svg.classList.remove('text-gray-700','text-green-700','text-yellow-700','text-gray-600');
+          if (icon === 'work'){
+            svg.classList.add('text-green-700');
+          } else if (icon === 'lunch'){
+            svg.classList.add('text-yellow-700');
+          } else {
+            svg.classList.add('text-gray-600');
+          }
         }
       }
     }catch(_e){
@@ -641,26 +674,27 @@
   // Cameras Online badge updater
   async function updateCamerasOnline(){
     try{
-      const el = document.getElementById('sys-cam-online');
-      const icon = document.querySelector('#sys-cam svg');
+      const el = document.getElementById('cam-val');
+      const icon = document.querySelector('#status-cam svg');
       if (!el) return;
       const res = await fetch('/api/cameras/status');
       const data = await res.json();
       const items = (data && Array.isArray(data.items)) ? data.items : [];
       const total = items.length;
       const online = items.reduce((acc, it)=> acc + ((it && (it.ai_running || it.stream_enabled)) ? 1 : 0), 0);
-      el.textContent = `CAM Online(s): ${online}${total?`/${total}`:''}`;
+      el.textContent = `${online}${total?`/${total}`:''}`; // Simplified: just "2/4"
+      el.title = `Cameras Online: ${online} of ${total}`; // Full text in tooltip
       if (icon){
         // reset classes then apply color
         try{
-          icon.classList.remove('text-gray-400','text-green-600');
+          icon.classList.remove('text-gray-500','text-green-600');
           if (online > 0){ icon.classList.add('text-green-600'); }
-          else { icon.classList.add('text-gray-400'); }
+          else { icon.classList.add('text-gray-500'); }
         }catch(_){ /* ignore */ }
       }
       try{
-        el.classList.remove('text-gray-700','text-green-700');
-        el.classList.add(online>0 ? 'text-green-700' : 'text-gray-700');
+        el.classList.remove('text-gray-600','text-green-700');
+        el.classList.add(online>0 ? 'text-green-700' : 'text-gray-600');
       }catch(_){ }
     }catch(_){ /* ignore */ }
   }
