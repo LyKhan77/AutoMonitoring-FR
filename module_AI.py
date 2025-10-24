@@ -12,6 +12,12 @@ import numpy as np
 import cv2
 from cachetools import TTLCache
 
+# Timezone helper for WIB (UTC+7)
+def _now_wib():
+    """Return current datetime in WIB timezone (UTC+7)."""
+    wib_tz = dt.timezone(dt.timedelta(hours=7))
+    return dt.datetime.now(wib_tz)
+
 from database_models import (
     get_session,
     Employee,
@@ -338,12 +344,15 @@ class TrackingManager:
                             today = ts.date()
                             att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
                             if att is None:
-                                att = Attendance(employee_id=emp_id, date=today, first_in_ts=ts, status='PRESENT')
+                                att = Attendance(employee_id=emp_id, date=today, first_in_ts=ts, status='PRESENT', entry_type='AUTO')
                                 db.add(att)
                             else:
                                 if att.first_in_ts is None:
                                     att.first_in_ts = ts
-                                att.status = att.status or 'PRESENT'
+                                # Only update status if not manual entry (protect admin overrides)
+                                if att.entry_type != 'MANUAL':
+                                    att.status = 'PRESENT'
+                                    att.entry_type = 'AUTO'
 
                     elif event_type == 'employee_timeout':
                         # This logic was moved from _update_timeouts
@@ -355,10 +364,12 @@ class TrackingManager:
                             today = now.date()
                             att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
                             if att is None:
-                                att = Attendance(employee_id=emp_id, date=today, last_out_ts=now, status='PRESENT')
+                                att = Attendance(employee_id=emp_id, date=today, last_out_ts=now, status='PRESENT', entry_type='AUTO')
                                 db.add(att)
                             else:
-                                att.last_out_ts = now
+                                # Only update if not manually set
+                                if att.entry_type != 'MANUAL':
+                                    att.last_out_ts = now
 
                     db.commit()
 
@@ -575,7 +586,7 @@ class TrackingManager:
     def _process_frame(self, cam_id: int, frame: np.ndarray):
         self.emb_store.load()
         faces = self.engine.get_faces(frame)
-        now = dt.datetime.utcnow()
+        now = _now_wib()
         dets: List[Tuple[Tuple[int,int,int,int], Optional[int], float, float]] = []
         for f in (faces or []):
             bbox = getattr(f, 'bbox', None)
@@ -735,7 +746,7 @@ class TrackingManager:
             # Load all cameras once (small table, minimal overhead)
             cam_map = {c.id: c for c in db.query(Camera).all()}
 
-        now = dt.datetime.utcnow()
+        now = _now_wib()
         THRESH = float(getattr(self, 'card_present_threshold', 60.0))
         items = []
         present_count = 0
@@ -748,7 +759,13 @@ class TrackingManager:
                 continue
 
             last_seen_ts = p.last_seen_ts
-            last_seen_iso = (last_seen_ts.isoformat() + 'Z') if last_seen_ts else None
+            # Handle timezone-naive timestamps from old database records
+            if last_seen_ts and last_seen_ts.tzinfo is None:
+                wib_tz = dt.timezone(dt.timedelta(hours=7))
+                last_seen_ts = last_seen_ts.replace(tzinfo=wib_tz)
+
+            # Use proper timezone serialization (WIB with +07:00 offset, not 'Z' which means UTC)
+            last_seen_iso = last_seen_ts.isoformat() if last_seen_ts else None
             seconds_since = None
             if last_seen_ts is not None:
                 try:

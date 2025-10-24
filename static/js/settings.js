@@ -91,10 +91,26 @@
     const btnSchPauseOff = document.getElementById('btn-sch-pause-offhours');
     const schPauseMin = document.getElementById('sch-pause-min');
     const btnSchPauseMin = document.getElementById('btn-sch-pause-min');
+    const schCurrentTime = document.getElementById('schedule-current-time');
     const trackingState = { tracking_active:false, suppress_alerts:false, auto_schedule:true };
 
+    async function updateSystemUptime(){
+        if (!schCurrentTime) return;
+        try{
+            const res = await fetch('/api/system/uptime');
+            const data = await res.json();
+            const seconds = data.uptime_seconds || 0;
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            const pad = n => String(n).padStart(2, '0');
+            schCurrentTime.textContent = `System Uptime: ${pad(h)}:${pad(m)}:${pad(s)}`;
+        }catch(e){
+            schCurrentTime.textContent = 'System Uptime: --:--:--';
+        }
+    }
     async function loadTrackingState(){ try{ const res = await fetch('/api/schedule/state'); if (!res.ok) return; const st = await res.json(); trackingState.tracking_active = !!st.tracking_active; trackingState.suppress_alerts = !!st.suppress_alerts; trackingState.auto_schedule = !!st.auto_schedule; if (schAuto) schAuto.checked = trackingState.auto_schedule; if (schWork) schWork.value = st.work_hours || '08:30-17:30'; if (schLunch) schLunch.value = st.lunch_break || '12:00-13:00'; renderScheduleBanner(st); }catch(e){} }
-    function renderScheduleBanner(st){ if (!schBanner) return; const active = !!st.tracking_active; const suppress = !!st.suppress_alerts; const auto = !!st.auto_schedule; let text = active ? 'Tracking: ACTIVE' : 'Tracking: INACTIVE'; if (suppress) text += ' • Alerts: SUPPRESSED'; text += auto ? ' • Mode: AUTO' : ' • Mode: MANUAL'; schBanner.textContent = text; schBanner.className = 'mb-3 p-3 rounded border text-sm ' + (active ? 'bg-green-50 border-green-200 text-green-700' : 'bg-gray-50 border-gray-200 text-gray-700'); }
+    function renderScheduleBanner(st){ if (!schBanner) return; const active = !!st.tracking_active; const suppress = !!st.suppress_alerts; const auto = !!st.auto_schedule; const pauseUntil = st.pause_until; const pauseKind = st.pause_kind; let text = active ? '✓ Tracking: ACTIVE' : '⊗ Tracking: INACTIVE'; if (suppress) text += ' • ⚠ Alerts: SUPPRESSED'; text += auto ? ' • Mode: AUTO' : ' • Mode: MANUAL'; if (pauseUntil) { try { const until = new Date(pauseUntil); const now = new Date(); if (until > now) { const kind = (pauseKind||'').toLowerCase(); const kindText = kind === 'lunch' ? '(Lunch Break)' : kind === 'offhours' ? '(Off-Hours)' : '(Manual)'; text += ` • ⏸ PAUSED ${kindText} until ${until.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'})} WIB`; } } catch(e){} } schBanner.textContent = text; schBanner.className = 'mb-3 p-3 rounded border text-sm font-mono ' + (active ? 'bg-green-50 border-green-200 text-green-700' : 'bg-gray-50 border-gray-200 text-gray-700'); }
     async function saveSchedule(){ if (!schAuto || !schWork || !schLunch) return; schMsg && (schMsg.textContent = ''); try{ const payload = { auto_schedule: schAuto.checked, work_hours: schWork.value.trim(), lunch_break: schLunch.value.trim(), clear_pause: true }; const res = await fetch('/api/schedule/mode', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)}); const data = await res.json().catch(()=>({})); if (res.ok){ schMsg && (schMsg.textContent = 'Saved'); schMsg && (schMsg.className='text-sm text-green-600'); renderScheduleBanner(data.state || {}); } else { schMsg && (schMsg.textContent = (data.error || 'Failed')); schMsg && (schMsg.className='text-sm text-red-600'); } }catch(e){ schMsg && (schMsg.textContent = 'Request failed'); schMsg && (schMsg.className='text-sm text-red-600'); } }
     async function resumeNow(){ if (!schAuto) return; schMsg && (schMsg.textContent = ''); try{ const isAuto = !!schAuto.checked; const payload = { auto_schedule: isAuto, clear_pause: true };
         // If manual mode, explicitly resume tracking and unsuppress alerts
@@ -110,6 +126,8 @@
     if (btnSchPauseOff) btnSchPauseOff.addEventListener('click', pauseUntilNextWork);
     if (btnSchPauseMin) btnSchPauseMin.addEventListener('click', pauseByMinutes);
     setInterval(loadTrackingState, 15000);
+    updateSystemUptime(); // Initial load
+    setInterval(updateSystemUptime, 1000); // Update uptime every second
 
     // Manage Employee
     const empTable = document.getElementById('employee-table');

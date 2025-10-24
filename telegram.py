@@ -5,6 +5,12 @@ import threading
 from typing import Dict, Any, List, Optional
 import urllib.request
 import datetime as dt
+
+# Timezone helper for WIB (UTC+7)
+def _now_wib():
+    """Return current datetime in WIB timezone (UTC+7)."""
+    wib_tz = dt.timezone(dt.timedelta(hours=7))
+    return dt.datetime.now(wib_tz)
 # --- Database Connection (Isolated) ---
 # This section makes telegram.py independent from app.py's models.
 from sqlalchemy import (
@@ -40,6 +46,7 @@ class Employee(Base):
     employee_code = Column(String)
     name = Column(String)
     department = Column(String)
+    is_active = Column(Boolean, default=True)
 
 class Camera(Base):
     __tablename__ = 'cameras'
@@ -117,6 +124,226 @@ def get_latest_capture_path(cam_id: int) -> Optional[str]:
         print(f"[get_latest_capture_path] Error for cam {cam_id}: {e}")
         return None
 
+
+# --- Excel Export Helper Functions ---
+
+def _to_wib_string(dtobj: Optional[dt.datetime]) -> Optional[str]:
+    """Convert UTC datetime to WIB (UTC+7) and format as readable string."""
+    if dtobj is None:
+        return None
+    try:
+        if dtobj.tzinfo is None:
+            dtobj_utc = dtobj.replace(tzinfo=dt.timezone.utc)
+        else:
+            dtobj_utc = dtobj.astimezone(dt.timezone.utc)
+        wib_tz = dt.timezone(dt.timedelta(hours=7))
+        dtobj_wib = dtobj_utc.astimezone(wib_tz)
+        return dtobj_wib.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        try:
+            return dtobj.isoformat(sep=' ')
+        except Exception:
+            return None
+
+
+def _in_range_telegram(timestamp: dt.datetime, time_range: str) -> bool:
+    """Check if timestamp falls within time range (HH:MM-HH:MM)."""
+    try:
+        if not time_range or '-' not in time_range:
+            return False
+        start_s, end_s = time_range.split('-', 1)
+        start_h, start_m = map(int, start_s.strip().split(':'))
+        end_h, end_m = map(int, end_s.strip().split(':'))
+        ts_time = timestamp.time()
+        start_time = dt.time(start_h, start_m)
+        end_time = dt.time(end_h, end_m)
+        return start_time <= ts_time <= end_time
+    except Exception:
+        return False
+
+
+def _compute_violation_counts_batch_telegram(db, attendance_rows: list) -> dict:
+    """Compute violation counts in batch to avoid N+1 query problem."""
+    from database_models import AlertLog
+    violation_map = {}
+    if not attendance_rows:
+        return violation_map
+    try:
+        emp_ids = list(set([att.employee_id for att, emp in attendance_rows]))
+        dates = [att.date for att, emp in attendance_rows if att.date]
+        if not dates:
+            return violation_map
+        min_date = min(dates)
+        max_date = max(dates)
+        min_dt = dt.datetime.combine(min_date, dt.time.min)
+        max_dt = dt.datetime.combine(max_date, dt.time.max)
+        all_exit_logs = db.query(AlertLog).filter(
+            AlertLog.employee_id.in_(emp_ids),
+            AlertLog.alert_type == 'EXIT',
+            AlertLog.timestamp >= min_dt,
+            AlertLog.timestamp <= max_dt
+        ).all()
+        for log in all_exit_logs:
+            log_date = log.timestamp.date()
+            key = (log.employee_id, log_date)
+            if (bool(log.schedule_tracking_active) and
+                not bool(log.schedule_is_manual_pause) and
+                not _in_range_telegram(log.timestamp, log.schedule_lunch_break or '12:00-13:00')):
+                violation_map[key] = violation_map.get(key, 0) + 1
+    except Exception as e:
+        print(f"[Violation Batch] Error: {e}")
+    return violation_map
+
+
+def generate_excel_report(report_type: str, from_date: str, to_date: str, emp_id: Optional[int] = None) -> Optional[str]:
+    """
+    Generate Excel report and save to temp file.
+
+    Args:
+        report_type: 'attendance' or 'alerts'
+        from_date: 'YYYY-MM-DD'
+        to_date: 'YYYY-MM-DD'
+        emp_id: Optional employee filter (None = all employees)
+
+    Returns:
+        Temp file path or None if failed
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from database_models import Attendance, Employee, AlertLog
+
+        # Parse dates
+        y1, m1, d1 = map(int, from_date.split('-'))
+        y2, m2, d2 = map(int, to_date.split('-'))
+        start_d = dt.date(y1, m1, d1)
+        end_d = dt.date(y2, m2, d2)
+
+        with SessionLocal() as db:
+            if report_type == 'attendance':
+                # Query attendance data
+                q = db.query(Attendance, Employee).join(Employee, Attendance.employee_id == Employee.id)
+                if emp_id:
+                    q = q.filter(Attendance.employee_id == emp_id)
+                q = q.filter(Attendance.date >= start_d, Attendance.date <= end_d)
+                q = q.order_by(Attendance.date.desc(), Employee.name.asc())
+                rows = q.all()
+
+                # Compute violation counts in batch
+                violation_map = _compute_violation_counts_batch_telegram(db, rows)
+
+                # Create workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Attendance Report"
+                headers = ['Employee Code', 'Employee Name', 'Date', 'First In', 'Last Out', 'Status', 'Violation', 'First In Camera', 'Last Out Camera']
+                ws.append(headers)
+                for cell in ws[1]:
+                    cell.font = Font(bold=True)
+
+                # Populate data
+                att_captures_dir = os.path.join(BASE_DIR, 'attendance_captures')
+                for att, emp in rows:
+                    vio = 0
+                    if att.date:
+                        vio = violation_map.get((att.employee_id, att.date), 0)
+
+                    # Read capture metadata
+                    first_in_camera = ''
+                    last_out_camera = ''
+                    if att.date and att.employee_id:
+                        day_s = att.date.isoformat()
+                        att_dir = os.path.join(att_captures_dir, day_s, str(att.employee_id))
+                        meta_path = os.path.join(att_dir, 'meta.json')
+                        if os.path.isfile(meta_path):
+                            try:
+                                with open(meta_path, 'r', encoding='utf-8') as f:
+                                    meta = json.load(f)
+                                if meta.get('first_in'):
+                                    first_in = meta['first_in']
+                                    area = first_in.get('cam_area', '')
+                                    name = first_in.get('cam_name', '')
+                                    if area and name:
+                                        first_in_camera = f"{area} - {name}"
+                                    elif name:
+                                        first_in_camera = name
+                                    elif area:
+                                        first_in_camera = area
+                                if meta.get('last_out'):
+                                    last_out = meta['last_out']
+                                    area = last_out.get('cam_area', '')
+                                    name = last_out.get('cam_name', '')
+                                    if area and name:
+                                        last_out_camera = f"{area} - {name}"
+                                    elif name:
+                                        last_out_camera = name
+                                    elif area:
+                                        last_out_camera = area
+                            except Exception:
+                                pass
+
+                    ws.append([
+                        emp.employee_code or '',
+                        emp.name or '',
+                        att.date.isoformat() if att.date else '',
+                        _to_wib_string(att.first_in_ts) or '',
+                        _to_wib_string(att.last_out_ts) or '',
+                        att.status or '',
+                        vio,
+                        first_in_camera,
+                        last_out_camera,
+                    ])
+
+            elif report_type == 'alerts':
+                # Query alert logs data
+                start_dt = dt.datetime.combine(start_d, dt.time.min)
+                end_dt = dt.datetime.combine(end_d, dt.time.max)
+                q = db.query(AlertLog, Employee).join(Employee, AlertLog.employee_id == Employee.id, isouter=True)
+                if emp_id:
+                    q = q.filter(AlertLog.employee_id == emp_id)
+                q = q.filter(AlertLog.timestamp >= start_dt, AlertLog.timestamp <= end_dt)
+                q = q.order_by(AlertLog.timestamp.desc())
+                rows = q.all()
+
+                # Create workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Alert Logs"
+                headers = ['Timestamp', 'Employee Code', 'Employee Name', 'Alert Type', 'Message', 'Notified To']
+                ws.append(headers)
+                for cell in ws[1]:
+                    cell.font = Font(bold=True)
+
+                # Populate data
+                for log, emp in rows:
+                    ws.append([
+                        _to_wib_string(log.timestamp) or '',
+                        (emp.employee_code if emp else ''),
+                        (emp.name if emp else ''),
+                        log.alert_type or '',
+                        log.message or '',
+                        log.notified_to or '',
+                    ])
+
+            else:
+                return None
+
+        # Save to temp file
+        temp_dir = os.path.join(BASE_DIR, 'temp_exports')
+        os.makedirs(temp_dir, exist_ok=True)
+        timestamp = _now_wib().strftime('%Y%m%d_%H%M%S')
+        filename = f"{report_type}_{from_date}_to_{to_date}_{timestamp}.xlsx"
+        file_path = os.path.join(temp_dir, filename)
+        wb.save(file_path)
+        return file_path
+
+    except Exception as e:
+        print(f"[Export] Generate Excel error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def load_tg_config() -> Dict[str, Any]:
     """Loads the Telegram configuration from JSON file."""
     global _tg_cfg
@@ -182,7 +409,7 @@ def send_telegram_photo(chat_id: str, photo_path: str, caption: str, bot_token: 
     url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
     boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
     headers = {'Content-Type': f'multipart/form-data; boundary={boundary}'}
-    
+
     parts = [
         f'--{boundary}', 'Content-Disposition: form-data; name="chat_id"', '', str(chat_id),
         f'--{boundary}', 'Content-Disposition: form-data; name="caption"', '', caption,
@@ -201,6 +428,33 @@ def send_telegram_photo(chat_id: str, photo_path: str, caption: str, bot_token: 
     except Exception as e:
         print(f"[Telegram] Photo send error: {e}")
         return False
+
+
+def send_telegram_document(chat_id: str, file_path: str, caption: str, bot_token: str) -> bool:
+    """Sends a document (Excel file) with a caption."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+    headers = {'Content-Type': f'multipart/form-data; boundary={boundary}'}
+
+    parts = [
+        f'--{boundary}', 'Content-Disposition: form-data; name="chat_id"', '', str(chat_id),
+        f'--{boundary}', 'Content-Disposition: form-data; name="caption"', '', caption,
+        f'--{boundary}', 'Content-Disposition: form-data; name="parse_mode"', '', 'HTML',
+        f'--{boundary}', f'Content-Disposition: form-data; name="document"; filename="{os.path.basename(file_path)}"', 'Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ''
+    ]
+    data = '\r\n'.join(parts).encode('utf-8')
+    with open(file_path, 'rb') as f:
+        data += b'\r\n' + f.read() + b'\r\n'
+    data += f'--{boundary}--\r\n'.encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=15.0) as resp:
+            return 200 <= resp.getcode() < 300
+    except Exception as e:
+        print(f"[Telegram] Document send error: {e}")
+        return False
+
 
 def get_updates(bot_token: str, offset: int) -> List[Dict]:
     """Fetches new updates from Telegram using long polling."""
@@ -305,6 +559,211 @@ def handle_callback_query(query: Dict, bot_token: str):
             send_telegram_message(chat_id, "❌ Terjadi kesalahan saat mengambil capture.", bot_token)
             _conversation_state.pop(chat_id, None)
 
+    # Export flow callbacks
+    elif state_info['state'] == 'awaiting_report_type' and data.startswith('export_'):
+        report_type = data.replace('export_', '')  # 'attendance' or 'alerts'
+        state_info['data']['report_type'] = report_type
+        state_info['state'] = 'awaiting_employee_filter'
+
+        # Show employee filter selection
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "👥 All Employees", "callback_data": "filter_all"}],
+                [{"text": "👤 Specific Employee", "callback_data": "filter_specific"}]
+            ]
+        }
+
+        report_name = "Attendance Report" if report_type == 'attendance' else "Alert Logs"
+        send_telegram_message(
+            chat_id,
+            f"📊 <b>{report_name}</b>\n\n👥 Filter Employee:",
+            bot_token,
+            reply_markup=keyboard
+        )
+
+    elif state_info['state'] == 'awaiting_employee_filter':
+        if data == 'filter_all':
+            # All employees - skip to date selection
+            state_info['data']['employee_id'] = None
+            state_info['state'] = 'awaiting_date_range'
+
+            # Show date range presets
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "📅 Hari Ini", "callback_data": "range_today"}],
+                    [{"text": "📅 Kemarin", "callback_data": "range_yesterday"}],
+                    [{"text": "📅 7 Hari Terakhir", "callback_data": "range_7days"}],
+                    [{"text": "📅 30 Hari Terakhir", "callback_data": "range_30days"}]
+                ]
+            }
+
+            report_name = "Attendance Report" if state_info['data']['report_type'] == 'attendance' else "Alert Logs"
+            send_telegram_message(
+                chat_id,
+                f"📅 <b>{report_name}</b>\n\nPilih rentang tanggal:",
+                bot_token,
+                reply_markup=keyboard
+            )
+
+        elif data == 'filter_specific':
+            # Show employee list
+            state_info['state'] = 'awaiting_employee_selection'
+
+            try:
+                with SessionLocal() as db:
+                    employees = db.query(Employee).filter(Employee.is_active == True).order_by(Employee.name).all()
+
+                if not employees:
+                    send_telegram_message(chat_id, "⚠️ Tidak ada karyawan aktif.", bot_token)
+                    _conversation_state.pop(chat_id, None)
+                    return
+
+                # Create employee selection keyboard
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": f"{emp.employee_code or 'EMP'} - {emp.name}", "callback_data": f"emp_{emp.id}"}]
+                        for emp in employees[:20]  # Limit to 20 employees for usability
+                    ]
+                }
+
+                send_telegram_message(
+                    chat_id,
+                    "📋 Pilih karyawan:",
+                    bot_token,
+                    reply_markup=keyboard
+                )
+            except Exception as e:
+                print(f"[Export Employee List] Error: {e}")
+                send_telegram_message(chat_id, "❌ Terjadi kesalahan saat memuat daftar karyawan.", bot_token)
+                _conversation_state.pop(chat_id, None)
+
+    elif state_info['state'] == 'awaiting_employee_selection' and data.startswith('emp_'):
+        try:
+            emp_id = int(data.split('_', 1)[1])
+            state_info['data']['employee_id'] = emp_id
+            state_info['state'] = 'awaiting_date_range'
+
+            # Get employee name for confirmation
+            with SessionLocal() as db:
+                employee = db.get(Employee, emp_id)
+                emp_name = employee.name if employee else f"ID {emp_id}"
+
+            # Show date range presets
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "📅 Hari Ini", "callback_data": "range_today"}],
+                    [{"text": "📅 Kemarin", "callback_data": "range_yesterday"}],
+                    [{"text": "📅 7 Hari Terakhir", "callback_data": "range_7days"}],
+                    [{"text": "📅 30 Hari Terakhir", "callback_data": "range_30days"}]
+                ]
+            }
+
+            report_name = "Attendance Report" if state_info['data']['report_type'] == 'attendance' else "Alert Logs"
+            send_telegram_message(
+                chat_id,
+                f"📅 <b>{report_name}</b>\n👤 Employee: {emp_name}\n\nPilih rentang tanggal:",
+                bot_token,
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            print(f"[Export Employee Select] Error: {e}")
+            send_telegram_message(chat_id, "❌ Terjadi kesalahan.", bot_token)
+            _conversation_state.pop(chat_id, None)
+
+    elif state_info['state'] == 'awaiting_date_range' and data.startswith('range_'):
+        try:
+            range_type = data.replace('range_', '')
+            today = dt.date.today()
+
+            if range_type == 'today':
+                from_date = to_date = today.isoformat()
+            elif range_type == 'yesterday':
+                yesterday = today - dt.timedelta(days=1)
+                from_date = to_date = yesterday.isoformat()
+            elif range_type == '7days':
+                from_date = (today - dt.timedelta(days=7)).isoformat()
+                to_date = today.isoformat()
+            elif range_type == '30days':
+                from_date = (today - dt.timedelta(days=30)).isoformat()
+                to_date = today.isoformat()
+            else:
+                send_telegram_message(chat_id, "❌ Rentang tanggal tidak valid.", bot_token)
+                _conversation_state.pop(chat_id, None)
+                return
+
+            state_info['data']['from_date'] = from_date
+            state_info['data']['to_date'] = to_date
+
+            # Generate and send report
+            _generate_and_send_export(chat_id, state_info['data'], bot_token)
+            _conversation_state.pop(chat_id, None)
+
+        except Exception as e:
+            print(f"[Export Date Range] Error: {e}")
+            send_telegram_message(chat_id, "❌ Terjadi kesalahan.", bot_token)
+            _conversation_state.pop(chat_id, None)
+
+def _generate_and_send_export(chat_id: str, data: dict, bot_token: str):
+    """Generate Excel and send to user."""
+    try:
+        report_type = data['report_type']
+        from_date = data['from_date']
+        to_date = data['to_date']
+        emp_id = data.get('employee_id')
+
+        # Get employee name if specific
+        emp_name = "All Employees"
+        if emp_id:
+            try:
+                with SessionLocal() as db:
+                    employee = db.get(Employee, emp_id)
+                    if employee:
+                        emp_name = f"{employee.employee_code or 'EMP'} - {employee.name}"
+            except Exception:
+                pass
+
+        # Show progress
+        send_telegram_message(chat_id, "⏳ Generating report...", bot_token)
+
+        # Generate Excel
+        file_path = generate_excel_report(report_type, from_date, to_date, emp_id)
+
+        if not file_path or not os.path.isfile(file_path):
+            send_telegram_message(chat_id, "❌ Gagal membuat report.", bot_token)
+            return
+
+        # Count rows (for caption)
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(file_path, read_only=True)
+            ws = wb.active
+            row_count = ws.max_row - 1  # -1 for header
+            wb.close()
+        except Exception:
+            row_count = 0
+
+        # Format caption
+        report_name = "Attendance Report" if report_type == 'attendance' else "Alert Logs"
+        caption = f"✅ <b>{report_name}</b>\n👤 {emp_name}\n📅 {from_date} to {to_date}\n📊 Total: {row_count} rows"
+
+        # Send document
+        success = send_telegram_document(chat_id, file_path, caption, bot_token)
+
+        if not success:
+            send_telegram_message(chat_id, "❌ Gagal mengirim file.", bot_token)
+
+        # Cleanup temp file
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[Export Send] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        send_telegram_message(chat_id, f"❌ Terjadi kesalahan: {str(e)}", bot_token)
+
 def send_attendance_preview(chat_id: int, emp_id: int, date_str: str, bot_token: str):
     """Fetches and sends the final attendance preview with images."""
     capture_dir = os.path.join(BASE_DIR, 'attendance_captures', date_str, str(emp_id))
@@ -405,20 +864,61 @@ def process_updates(bot_token: str):
                 _bot_active_chats.discard(chat_id)
                 response_message = "Bot telah di-Jeda ⏳"
                 send_telegram_message(chat_id, response_message, bot_token)
+
+        elif command.startswith('/help'):
+            help_text = """<b>📖 Bot Command Guide</b>
+
+<b>/start</b> - Activate bot notifications
+<b>/stop</b> - Pause bot notifications
+<b>/help</b> - Show this help message
+<b>/status</b> - Show system status
+<b>/attendance</b> - View daily attendance report
+<b>/capture</b> - Get latest camera capture
+<b>/export_data</b> - Export Excel reports
+
+<b>📊 Export Data Flow:</b>
+1. Choose report type (Attendance/Alerts)
+2. Filter by employee (All/Specific)
+3. Select date range (Today/Yesterday/7d/30d)
+4. Receive Excel file
+
+Need help? Contact your supervisor."""
+            send_telegram_message(chat_id, help_text, bot_token)
+
         elif command.startswith('/status'):
             try:
-                state = _get_live_schedule_state()
-                status_str = _get_status_string(state)
-                status_map = {
-                    'work_hours': 'Work Hours',
-                    'lunch_break': 'Lunch Break',
-                    'off_hours': 'Off Hours'
-                }
-                display_status = status_map.get(status_str, 'Unknown')
-                response_message = f"Status schedule system saat ini sedang <b>{display_status}</b>."
-                send_telegram_message(chat_id, response_message, bot_token)
+                with SessionLocal() as db:
+                    # Count active employees
+                    total_emp = db.query(Employee).filter(Employee.is_active == True).count()
+
+                    # Count attendance today
+                    today = dt.date.today()
+                    today_att = db.query(Attendance).filter(Attendance.date == today).count()
+
+                    # Count alerts today
+                    start_dt = dt.datetime.combine(today, dt.time.min)
+                    end_dt = dt.datetime.combine(today, dt.time.max)
+                    today_alerts = db.query(AlertLog).filter(
+                        AlertLog.timestamp >= start_dt,
+                        AlertLog.timestamp <= end_dt
+                    ).count()
+
+                    # Get camera count
+                    total_cameras = db.query(Camera).count()
+
+                wib_now = dt.datetime.now(dt.timezone(dt.timedelta(hours=7)))
+                status_text = f"""<b>📊 System Status</b>
+
+👥 <b>Employees:</b> {total_emp} active
+📸 <b>Cameras:</b> {total_cameras} total
+📅 <b>Attendance Today:</b> {today_att} records
+🚨 <b>Alerts Today:</b> {today_alerts} logs
+
+<i>Last updated: {wib_now.strftime('%H:%M:%S WIB')}</i>"""
+                send_telegram_message(chat_id, status_text, bot_token)
             except Exception as e:
                 print(f"[Status Command] Error: {e}")
+                send_telegram_message(chat_id, "❌ Gagal mengambil status sistem.", bot_token)
         elif command.startswith('/attendance'):
             # Start the attendance report flow
             _conversation_state[chat_id] = {'state': 'awaiting_date', 'data': {}}
@@ -460,6 +960,30 @@ def process_updates(bot_token: str):
             except Exception as e:
                 print(f"[Capture Command] Error: {e}")
                 send_telegram_message(chat_id, "❌ Terjadi kesalahan saat memuat daftar kamera.", bot_token)
+
+        elif command.startswith('/export_data'):
+            # Start the export data flow
+            try:
+                # Initialize conversation state
+                _conversation_state[chat_id] = {'state': 'awaiting_report_type', 'data': {}}
+
+                # Show report type selection
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "📊 Attendance Report", "callback_data": "export_attendance"}],
+                        [{"text": "🚨 Alert Logs", "callback_data": "export_alerts"}]
+                    ]
+                }
+
+                send_telegram_message(
+                    chat_id,
+                    "📊 <b>Export Data Report</b>\n\nSilakan pilih jenis laporan yang ingin diunduh:",
+                    bot_token,
+                    reply_markup=keyboard
+                )
+            except Exception as e:
+                print(f"[Export Command] Error: {e}")
+                send_telegram_message(chat_id, "❌ Terjadi kesalahan.", bot_token)
 
 def poll_and_send_alerts(bot_token: str):
     """Periodically checks the database for new alerts and sends them."""

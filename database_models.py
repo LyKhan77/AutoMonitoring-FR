@@ -5,6 +5,12 @@ import json
 import os
 from typing import Optional
 
+# Timezone helper for WIB (UTC+7)
+def _now_wib():
+    """Return current datetime in WIB timezone (UTC+7)."""
+    wib_tz = datetime.timezone(datetime.timedelta(hours=7))
+    return datetime.datetime.now(wib_tz)
+
 from sqlalchemy import (
     create_engine,
     Column,
@@ -99,7 +105,7 @@ class FaceTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'), nullable=False, index=True)
     embedding = Column(LargeBinary, nullable=False)  # simpan bytes dari np.ndarray.tobytes()
-    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=_now_wib, nullable=False)
     # metadata untuk multi-angle dan kualitas
     pose_label = Column(String(16))  # contoh: 'front', 'left', 'right'
     quality_score = Column(Float)    # skor kualitas [0..1] (berdasarkan blur/brightness/size)
@@ -129,7 +135,7 @@ class Event(Base):
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'), nullable=True, index=True)  # None untuk unknown
     camera_id = Column(Integer, ForeignKey('cameras.id'), nullable=False, index=True)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+    timestamp = Column(DateTime, default=_now_wib, nullable=False, index=True)
     similarity_score = Column(Float)  # skor kemiripan jika recognized
     track_id = Column(String)  # opsional: id tracking dari tracker
 
@@ -169,12 +175,14 @@ class Attendance(Base):
     first_in_ts = Column(DateTime)  # kapan pertama terlihat hari itu
     last_out_ts = Column(DateTime)  # kapan terakhir tidak terlihat (keluar area)
     status = Column(String, default='ABSENT')  # PRESENT, ABSENT, LATE, dll
+    entry_type = Column(String, default='AUTO')  # AUTO (AI-detected), MANUAL (admin-set), SYSTEM (scheduler-marked)
 
     employee = relationship("Employee", back_populates="attendances")
 
     __table_args__ = (
         UniqueConstraint('employee_id', 'date', name='uq_attendance_emp_date'),
         Index('ix_attendance_emp_date', 'employee_id', 'date'),
+        Index('ix_attendance_date', 'date'),  # For daily reports and date range scans
     )
 
 
@@ -184,10 +192,10 @@ class AlertLog(Base):
     __tablename__ = 'alert_logs'
 
     id = Column(Integer, primary_key=True, index=True)
-    employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'))
+    employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'), index=True)
     camera_id = Column(Integer, ForeignKey('cameras.id'), nullable=True)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
-    alert_type = Column(String)  # contoh: OUT_OF_AREA
+    timestamp = Column(DateTime, default=_now_wib, nullable=False, index=True)
+    alert_type = Column(String, index=True)  # contoh: OUT_OF_AREA
     message = Column(String)
     notified_to = Column(String)  # contoh: Supervisor John Doe / phone number
     notified_telegram = Column(Boolean, default=False, nullable=False, index=True)
@@ -199,6 +207,15 @@ class AlertLog(Base):
 
     employee = relationship("Employee", back_populates="alert_logs")
     camera = relationship("Camera")
+
+    __table_args__ = (
+        # Composite index for date range + employee filtering (Excel export queries)
+        Index('ix_alert_logs_emp_ts', 'employee_id', 'timestamp'),
+        # Composite index for alert type + timestamp (violation count queries)
+        Index('ix_alert_logs_type_ts', 'alert_type', 'timestamp'),
+        # Composite index for Telegram bot polling (unnotified alerts)
+        Index('ix_alert_logs_telegram_ts', 'notified_telegram', 'timestamp'),
+    )
 
 
 # --- Utilitas DB --- #

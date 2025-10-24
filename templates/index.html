@@ -611,6 +611,7 @@
                     <section id="schedule-system" class="hidden">
                         <div class="flex justify-between items-center mb-3">
                             <h3 class="text-lg font-semibold text-primary">Schedule System</h3>
+                            <div id="schedule-current-time" class="text-sm text-gray-600 font-mono"></div>
                         </div>
                         <div id="schedule-banner" class="mb-3 p-3 rounded border text-sm"></div>
                         <div class="p-3 border rounded bg-gray-50 space-y-3">
@@ -623,11 +624,11 @@
                                     <span>Follow Auto Schedule</span>
                                 </div>
                                 <div>
-                                    <label class="block text-xs text-gray-600 mb-1">Work Hours (HH:MM-HH:MM)</label>
+                                    <label class="block text-xs text-gray-600 mb-1">Work Hours <span class="text-primary font-semibold">(WIB)</span></label>
                                     <input id="sch-work" type="text" class="w-full border rounded px-2 py-1" placeholder="08:30-17:30" />
                                 </div>
                                 <div>
-                                    <label class="block text-xs text-gray-600 mb-1">Lunch Break (HH:MM-HH:MM)</label>
+                                    <label class="block text-xs text-gray-600 mb-1">Lunch Break <span class="text-primary font-semibold">(WIB)</span></label>
                                     <input id="sch-lunch" type="text" class="w-full border rounded px-2 py-1" placeholder="12:00-13:00" />
                                 </div>
                             </div>
