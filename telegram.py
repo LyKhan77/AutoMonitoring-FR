@@ -903,6 +903,18 @@ Need help? Contact your supervisor."""
 
         elif command.startswith('/status'):
             try:
+                # Get schedule status first
+                schedule_state = _get_live_schedule_state()
+                schedule_status_raw = _get_status_string(schedule_state)
+                
+                schedule_status_display = "Unknown"
+                if schedule_status_raw == 'work_hours':
+                    schedule_status_display = "Work Hours 💼"
+                elif schedule_status_raw == 'lunch_break':
+                    schedule_status_display = "Lunch Break 🍽"
+                elif schedule_status_raw == 'off_hours':
+                    schedule_status_display = "Off Hours 🌙"
+
                 with SessionLocal() as db:
                     # Count active employees
                     total_emp = db.query(Employee).filter(Employee.is_active == True).count()
@@ -926,6 +938,7 @@ Need help? Contact your supervisor."""
                 wib_now = dt.datetime.now(dt.timezone(dt.timedelta(hours=7)))
                 status_text = f"""<b>📊 System Status</b>
 
+⏰ <b>Schedule:</b> {schedule_status_display}
 👥 <b>Employees:</b> {total_emp} active
 📸 <b>Cameras:</b> {total_cameras} total
 📅 <b>Attendance Today:</b> {today_att} records
