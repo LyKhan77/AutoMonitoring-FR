@@ -129,23 +129,31 @@ def get_latest_capture_path(cam_id: int) -> Optional[str]:
 
 # --- Excel Export Helper Functions ---
 
-def _to_wib_string(dtobj: Optional[dt.datetime]) -> Optional[str]:
-    """Convert UTC datetime to WIB (UTC+7) and format as readable string."""
+def _to_wib_string(dtobj: Optional[dt.datetime]) -> str:
+    """Formats a datetime object to a WIB (UTC+7) string for display.
+    - If the object is timezone-aware, it's converted to WIB.
+    - If the object is naive, it's assumed to be in WIB already.
+    Returns: 'YYYY-MM-DD HH:MM:S' in WIB, or empty string on failure.
+    """
     if dtobj is None:
-        return None
+        return ""
+    
+    wib_tz = dt.timezone(dt.timedelta(hours=7))
+
     try:
-        if dtobj.tzinfo is None:
-            dtobj_utc = dtobj.replace(tzinfo=dt.timezone.utc)
+        if dtobj.tzinfo is not None:
+            # Aware: convert to WIB
+            dtobj_wib = dtobj.astimezone(wib_tz)
         else:
-            dtobj_utc = dtobj.astimezone(dt.timezone.utc)
-        wib_tz = dt.timezone(dt.timedelta(hours=7))
-        dtobj_wib = dtobj_utc.astimezone(wib_tz)
+            # Naive: assume it's already in WIB
+            dtobj_wib = dtobj
+        
         return dtobj_wib.strftime('%Y-%m-%d %H:%M:%S')
     except Exception:
         try:
             return dtobj.isoformat(sep=' ')
         except Exception:
-            return None
+            return ""
 
 
 def _in_range_telegram(timestamp: dt.datetime, time_range: str) -> bool:
