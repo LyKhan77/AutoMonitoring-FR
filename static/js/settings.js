@@ -39,26 +39,72 @@
     if (tabSch) tabSch.addEventListener('click', ()=>{ setActiveTab('schedule'); });
     if (secSch) { setActiveTab('schedule'); }
 
-    // Manage System: Restart/Shutdown
+    // Manage System: Restart/Shutdown (Simplified - No Overlay)
     const btnResetSystem = document.getElementById('btn-reset-system');
     const sysResetMsg = document.getElementById('sys-reset-msg');
     if (btnResetSystem){
       btnResetSystem.addEventListener('click', async ()=>{
-        const ok = await (window.App && App.confirmDialog ? App.confirmDialog({
-          title: 'Restart System',
-          message: 'The application will restart. This will temporarily disconnect the session.',
-          confirmText: 'Restart',
-          cancelText: 'Cancel'
-        }) : Promise.resolve(confirm('Are you sure you want to restart the system now?')));
-        if (!ok) return;
+        // Simple confirmation
+        const confirmed = confirm(
+          'RESTART SYSTEM\n\n' +
+          'Server akan restart di terminal yang sama.\n' +
+          'Setelah klik OK:\n' +
+          '1. Tunggu 10 detik\n' +
+          '2. Tekan F5 atau Ctrl+R untuk refresh page\n\n' +
+          'Lanjutkan restart?'
+        );
+
+        if (!confirmed) return;
+
+        // Disable button
         btnResetSystem.disabled = true;
-        if (sysResetMsg){ sysResetMsg.textContent = 'Restarting...'; sysResetMsg.className = 'text-sm ml-2 text-gray-600'; }
+        if (sysResetMsg){
+          sysResetMsg.textContent = 'Restarting system...';
+          sysResetMsg.className = 'text-sm ml-2 text-yellow-600';
+        }
+
         try{
-          const res = await fetch('/api/system/restart', { method:'POST' });
-          const data = await res.json().catch(()=>({}));
-          if (res.ok){ if (sysResetMsg){ sysResetMsg.textContent = 'System is restarting...'; sysResetMsg.className = 'text-sm ml-2 text-green-600'; } setTimeout(()=>{ btnResetSystem.disabled = false; }, 3000); }
-          else { if (sysResetMsg){ sysResetMsg.textContent = data.error || 'Failed to restart'; sysResetMsg.className = 'text-sm ml-2 text-red-600'; } btnResetSystem.disabled = false; }
-        }catch(err){ if (sysResetMsg){ sysResetMsg.textContent = 'Request failed'; sysResetMsg.className = 'text-sm ml-2 text-red-600'; } btnResetSystem.disabled = false; }
+          // Send restart command
+          await fetch('/api/system/restart', { method:'POST' });
+
+          // Show success message
+          if (sysResetMsg){
+            sysResetMsg.textContent = '✓ Restart command sent. Tunggu 10 detik, lalu tekan F5 untuk refresh.';
+            sysResetMsg.className = 'text-sm ml-2 text-green-600';
+          }
+
+          // Show alert after 2 seconds (give time for server to start shutting down)
+          setTimeout(() => {
+            alert(
+              'SERVER SEDANG RESTART\n\n' +
+              '✓ Restart command berhasil dikirim\n\n' +
+              'NEXT STEPS:\n' +
+              '1. Tunggu 10 detik untuk server selesai restart\n' +
+              '2. Tekan F5 atau Ctrl+R untuk refresh page\n' +
+              '3. Dashboard akan kembali normal\n\n' +
+              'Check terminal untuk melihat log restart.'
+            );
+          }, 2000);
+
+        }catch(err){
+          // Network error means server already disconnecting (good sign!)
+          if (sysResetMsg){
+            sysResetMsg.textContent = '✓ Server disconnecting... Tunggu 10 detik, lalu tekan F5 untuk refresh.';
+            sysResetMsg.className = 'text-sm ml-2 text-yellow-600';
+          }
+
+          // Show alert
+          setTimeout(() => {
+            alert(
+              'SERVER SEDANG RESTART\n\n' +
+              'Server sudah mulai restart.\n\n' +
+              'NEXT STEPS:\n' +
+              '1. Tunggu 10 detik\n' +
+              '2. Tekan F5 atau Ctrl+R untuk refresh\n\n' +
+              'Check terminal untuk log restart.'
+            );
+          }, 1000);
+        }
       });
     }
     const btnShutdownSystem = document.getElementById('btn-shutdown-system');

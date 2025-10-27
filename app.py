@@ -95,7 +95,8 @@ def _save_snapshot_for_camera(cam_id: int) -> bool:
     """Fetch snapshot from our own API and store to captures/<cam_id>/; return True if saved."""
     try:
         import urllib.request
-        ts = _now_utc().strftime('%Y%m%d_%H%M%S')
+        # Use WIB timezone for filename timestamp (consistent with system)
+        ts = _now_wib().strftime('%Y%m%d_%H%M%S')
         url = f'http://127.0.0.1:5000/api/cameras/{int(cam_id)}/snapshot?annotate=1'
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=4.0) as resp:
@@ -115,8 +116,10 @@ def _save_snapshot_for_camera(cam_id: int) -> bool:
                     except Exception: pass
         except Exception:
             pass
+        print(f"[Frame Capture] Saved snapshot for CAM{cam_id}: {fname}")
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[Frame Capture] Failed to save snapshot for CAM{cam_id}: {e}")
         return False
 
 def _background_capture_saver_loop(interval_sec: int = 5):
@@ -536,6 +539,10 @@ def _now_local():
     wib_tz = dt.timezone(dt.timedelta(hours=7))
     return dt.datetime.now(wib_tz)
 
+def _now_wib():
+    """Get current time in WIB timezone (UTC+7) - alias for _now_local()."""
+    return _now_local()
+
 def _now_utc():
     """Get current time in UTC timezone (timezone-aware)."""
     return dt.datetime.now(dt.timezone.utc)
@@ -761,6 +768,23 @@ def api_system_uptime():
     elapsed = time.time() - _system_start_time
     return jsonify({'uptime_seconds': int(elapsed)})
 
+@app.route('/api/system/health')
+def api_system_health():
+    """
+    Health check endpoint for monitoring system status.
+    Used by frontend to detect when server is back up after restart.
+    """
+    global _system_start_time
+    uptime = 0
+    if _system_start_time is not None:
+        uptime = int(time.time() - _system_start_time)
+
+    return jsonify({
+        'status': 'ok',
+        'uptime_seconds': uptime,
+        'timestamp': dt.datetime.now().isoformat()
+    })
+
 
 # Serve GSPE logo asset
 @app.route('/assets/logo')
@@ -873,10 +897,13 @@ def api_captures_per_camera_latest():
         if latest:
             url = f'/captures/{int(cam_id)}/{latest}'
             try:
-                # parse timestamp from filename YYYYMMDD_HHMMSS.jpg as UTC
+                # Parse timestamp from filename YYYYMMDD_HHMMSS.jpg as WIB (UTC+7)
                 ts_part = latest.split('.')[0]
-                dt_utc = dt.datetime.strptime(ts_part, '%Y%m%d_%H%M%S')
-                ts_iso = _to_iso_utc(dt_utc)
+                dt_naive = dt.datetime.strptime(ts_part, '%Y%m%d_%H%M%S')
+                # Add WIB timezone info since filename is in WIB
+                wib_tz = dt.timezone(dt.timedelta(hours=7))
+                dt_wib = dt_naive.replace(tzinfo=wib_tz)
+                ts_iso = _to_iso_utc(dt_wib)
             except Exception:
                 ts_iso = None
         out.append({
@@ -896,14 +923,23 @@ def _nearest_capture_for(cam_id: int, target_ts: dt.datetime, max_delta_sec: int
         if not files:
             return ''
         # Sort and find closest by filename timestamp
+        # Filenames are in WIB timezone (UTC+7)
+        wib_tz = dt.timezone(dt.timedelta(hours=7))
         best_url = ''
         best_dt = None
         best_diff = None
         for fn in files:
             try:
                 ts_part = fn.split('.')[0]
-                fdt = dt.datetime.strptime(ts_part, '%Y%m%d_%H%M%S')
-                diff = abs((fdt - target_ts).total_seconds())
+                fdt_naive = dt.datetime.strptime(ts_part, '%Y%m%d_%H%M%S')
+                # Add WIB timezone info
+                fdt = fdt_naive.replace(tzinfo=wib_tz)
+                # Ensure target_ts is also timezone-aware for comparison
+                if target_ts.tzinfo is None:
+                    target_ts_aware = target_ts.replace(tzinfo=wib_tz)
+                else:
+                    target_ts_aware = target_ts.astimezone(wib_tz)
+                diff = abs((fdt - target_ts_aware).total_seconds())
                 if best_diff is None or diff < best_diff:
                     best_diff = diff; best_dt = fdt; best_url = f'/captures/{int(cam_id)}/{fn}'
             except Exception:
@@ -2374,8 +2410,9 @@ class RTSPFrameSource:
     def close(self):
         if self._cap: self._cap.release()
 
-@app.route('/api/cameras/status')
-def cameras_status():
+@app.route('/api/cameras/status_legacy')
+def cameras_status_legacy():
+    """Legacy endpoint - use /api/cameras/status instead"""
     global _camera_map
     if not _camera_map:
         _camera_map = load_cameras()
@@ -2845,31 +2882,83 @@ def api_admin_reset_logs():
 # --- System: Restart process ---
 @app.route('/api/system/restart', methods=['POST'])
 def api_system_restart():
-    """Restart this Python process. Returns immediately then execs self in a background thread."""
+    """
+    Gracefully restart the application in the same terminal.
+    Uses os.execv() to replace the current process with a new one.
+    """
     try:
         def _do_restart():
             try:
-                # small delay to allow HTTP response to flush
-                time.sleep(0.5)
-                python = sys.executable or 'python'
-                cmd = [python] + list(sys.argv)
-                # On Windows, detach so new process isn't killed when this one exits
-                creationflags = 0
+                # Log restart event
+                print(f"[RESTART] System restart requested at {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} WIB")
+
+                # Notify all connected Socket.IO clients that server is restarting
                 try:
-                    DETACHED_PROCESS = 0x00000008
-                    CREATE_NEW_PROCESS_GROUP = 0x00000200
-                    creationflags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-                except Exception:
-                    creationflags = 0
+                    socketio.emit('server_restarting', {
+                        'message': 'Server is restarting...',
+                        'estimated_downtime': 10
+                    }, broadcast=True)
+                    socketio.sleep(0.2)  # Give time for message to be sent
+                except Exception as e:
+                    print(f"[RESTART] Failed to emit restart event: {e}")
+
+                # Graceful shutdown: Stop AI manager
                 try:
-                    subprocess.Popen(cmd, close_fds=True, creationflags=creationflags)
-                except Exception:
-                    subprocess.Popen(cmd)
-            finally:
-                # terminate current process to free the port
-                os._exit(0)
+                    if ai_manager is not None and hasattr(ai_manager, 'stop'):
+                        print("[RESTART] Stopping AI manager...")
+                        ai_manager.stop()
+                        print("[RESTART] AI manager stopped")
+                except Exception as e:
+                    print(f"[RESTART] Error stopping AI manager: {e}")
+
+                # Graceful shutdown: Stop all stream workers
+                try:
+                    if _workers_by_sid:
+                        print(f"[RESTART] Stopping {len(_workers_by_sid)} stream workers...")
+                        for sid, worker in list(_workers_by_sid.items()):
+                            try:
+                                if hasattr(worker, 'stop'):
+                                    worker.stop()
+                            except Exception as e:
+                                print(f"[RESTART] Error stopping worker {sid}: {e}")
+                        print("[RESTART] Stream workers stopped")
+                except Exception as e:
+                    print(f"[RESTART] Error stopping stream workers: {e}")
+
+                # Delay to allow HTTP response to flush and cleanup to complete
+                print("[RESTART] Graceful shutdown completed, restarting in 1 second...")
+                time.sleep(1.0)
+
+                # Prepare restart command
+                python = sys.executable
+                if not python:
+                    python = 'python'
+
+                # Use os.execv() to replace current process (restart in same terminal)
+                # This will NOT spawn a new terminal or background process
+                args = [python] + sys.argv
+
+                print(f"[RESTART] Executing: {' '.join(args)}")
+                sys.stdout.flush()
+                sys.stderr.flush()
+
+                # Replace current process with new one (same PID, same terminal)
+                # Note: os.execv() may not work on Windows - will use os.execl() as fallback
+                try:
+                    os.execv(python, args)
+                except (OSError, AttributeError) as e:
+                    print(f"[RESTART] os.execv failed ({e}), trying os.execl...")
+                    os.execl(python, python, *sys.argv[1:])
+
+            except Exception as e:
+                print(f"[RESTART] Fatal error during restart: {e}")
+                # Fallback to exit if execv fails
+                os._exit(1)
+
+        # Start restart in background thread to allow response to be sent first
         threading.Thread(target=_do_restart, daemon=True).start()
         return jsonify({'ok': True, 'message': 'Restarting system...'}), 200
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

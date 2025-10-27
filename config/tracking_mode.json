@@ -4,6 +4,6 @@
   "suppress_alerts": false,
   "pause_until": null,
   "work_hours": "08:30-17:30",
-  "lunch_break": "11:30-13:00",
+  "lunch_break": "12:00-13:00",
   "pause_kind": null
 }

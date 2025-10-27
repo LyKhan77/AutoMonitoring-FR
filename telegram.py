@@ -71,7 +71,9 @@ class AlertLog(Base):
     __tablename__ = 'alert_logs'
     id = Column(Integer, primary_key=True)
     employee_id = Column(Integer, ForeignKey('employees.id'))
-    timestamp = Column(DateTime, default=dt.datetime.utcnow)
+    # Use _now_wib() for consistency with app.py and database_models.py
+    # Note: This model is read-only in telegram.py, AlertLog records are created by app.py
+    timestamp = Column(DateTime, default=lambda: _now_wib())
     camera_id = Column(Integer, ForeignKey('cameras.id'))
     message = Column(String)
     alert_type = Column(String)
@@ -296,8 +298,10 @@ def generate_excel_report(report_type: str, from_date: str, to_date: str, emp_id
 
             elif report_type == 'alerts':
                 # Query alert logs data
-                start_dt = dt.datetime.combine(start_d, dt.time.min)
-                end_dt = dt.datetime.combine(end_d, dt.time.max)
+                # Create WIB timezone-aware datetime for filtering
+                wib_tz = dt.timezone(dt.timedelta(hours=7))
+                start_dt = dt.datetime.combine(start_d, dt.time.min, tzinfo=wib_tz)
+                end_dt = dt.datetime.combine(end_d, dt.time.max, tzinfo=wib_tz)
                 q = db.query(AlertLog, Employee).join(Employee, AlertLog.employee_id == Employee.id, isouter=True)
                 if emp_id:
                     q = q.filter(AlertLog.employee_id == emp_id)
@@ -533,11 +537,15 @@ def handle_callback_query(query: Dict, bot_token: str):
                 return
 
             # Extract timestamp from filename (YYYYMMDD_HHMMSS.jpg)
+            # Filename is in WIB timezone, so we need to add timezone info
             filename = os.path.basename(capture_path)
             timestamp_str = filename.replace('.jpg', '').replace('.JPG', '')
             try:
                 timestamp = dt.datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
-                formatted_time = timestamp.strftime('%d %b %Y, %H:%M:%S')
+                # Add WIB timezone info (UTC+7)
+                wib_tz = dt.timezone(dt.timedelta(hours=7))
+                timestamp = timestamp.replace(tzinfo=wib_tz)
+                formatted_time = timestamp.strftime('%d %b %Y, %H:%M:%S WIB')
             except:
                 formatted_time = timestamp_str
 
@@ -891,13 +899,14 @@ Need help? Contact your supervisor."""
                     # Count active employees
                     total_emp = db.query(Employee).filter(Employee.is_active == True).count()
 
-                    # Count attendance today
-                    today = dt.date.today()
-                    today_att = db.query(Attendance).filter(Attendance.date == today).count()
+                    # Count attendance today (using WIB date)
+                    wib_tz = dt.timezone(dt.timedelta(hours=7))
+                    today_wib = dt.datetime.now(wib_tz).date()
+                    today_att = db.query(Attendance).filter(Attendance.date == today_wib).count()
 
-                    # Count alerts today
-                    start_dt = dt.datetime.combine(today, dt.time.min)
-                    end_dt = dt.datetime.combine(today, dt.time.max)
+                    # Count alerts today (using WIB timezone)
+                    start_dt = dt.datetime.combine(today_wib, dt.time.min, tzinfo=wib_tz)
+                    end_dt = dt.datetime.combine(today_wib, dt.time.max, tzinfo=wib_tz)
                     today_alerts = db.query(AlertLog).filter(
                         AlertLog.timestamp >= start_dt,
                         AlertLog.timestamp <= end_dt
@@ -1010,12 +1019,16 @@ def poll_and_send_alerts(bot_token: str):
             emp_code = emp.employee_code if emp else "N/A"
             dept = emp.department if emp else "-"
             
-            # Format waktu ke zona waktu lokal (asumsi server di WIB)
+            # Format waktu ke zona waktu lokal (WIB/UTC+7)
+            # Timestamps in database are already in WIB timezone
             try:
-                # Timestamp dari DB adalah UTC, konversi ke WIB (UTC+7)
-                log_time_utc = log.timestamp.replace(tzinfo=dt.timezone.utc)
                 wib_tz = dt.timezone(dt.timedelta(hours=7))
-                log_time_wib = log_time_utc.astimezone(wib_tz)
+                # If timestamp is naive, assume it's already WIB
+                if log.timestamp.tzinfo is None:
+                    log_time_wib = log.timestamp.replace(tzinfo=wib_tz)
+                else:
+                    # If timezone-aware, convert to WIB
+                    log_time_wib = log.timestamp.astimezone(wib_tz)
                 date_part = log_time_wib.strftime('%d-%m-%Y')
                 time_part = log_time_wib.strftime('%H:%M:%S')
             except Exception:
