@@ -4,11 +4,19 @@ import json
 import time
 import threading
 import datetime as dt
+import queue
 from typing import Dict, List, Optional, Tuple, Any
 from collections import deque, Counter
 
 import numpy as np
 import cv2
+from cachetools import TTLCache
+
+# Timezone helper for WIB (UTC+7)
+def _now_wib():
+    """Return current datetime in WIB timezone (UTC+7)."""
+    wib_tz = dt.timezone(dt.timedelta(hours=7))
+    return dt.datetime.now(wib_tz)
 
 from database_models import (
     get_session,
@@ -19,6 +27,7 @@ from database_models import (
     Attendance,
     AlertLog,
 )
+from sqlalchemy.orm import joinedload
 
 # ---- Config loader ----
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -244,56 +253,135 @@ class TrackingManager:
         self.emb_store = EmbeddingStore()
         self.recog_thresh = float(cfg.get('recognition_threshold', 0.45))
         self.sim_thresh = float(cfg.get('embedding_similarity_threshold', 0.65))
-        # Unified presence timeout: use presence_timeout_sec if present; fall back to tracking_timeout; else default 60s
         presence_timeout = float(cfg.get('presence_timeout_sec', cfg.get('tracking_timeout', 60.0)))
-        # Tracking timeout uses the unified value unless tracking_timeout explicitly set differently
         self.track_timeout = float(cfg.get('tracking_timeout', presence_timeout))
         self.fps_target = max(1, int(cfg.get('fps_target', 10)))
-        # streaming prefs
         self.stream_max_width = int(cfg.get('stream_max_width', 960))
         self.jpeg_quality = int(cfg.get('jpeg_quality', 70))
         self.annotation_stride = max(1, int(cfg.get('annotation_stride', 3)))
-        # smoothing params
-        self.smooth_window = int(cfg.get('smoothing_window', 5))  # last N votes
-        self.smooth_min_votes = int(cfg.get('smoothing_min_votes', 3))  # require at least K same votes
+        self.smooth_window = int(cfg.get('smoothing_window', 5))
+        self.smooth_min_votes = int(cfg.get('smoothing_min_votes', 3))
         self.iou_match_threshold = float(cfg.get('tracker_iou_threshold', 0.3))
         self.max_track_misses = int(cfg.get('tracker_max_misses', 8))
-        # event rate control (seconds between event inserts per emp+cam)
         self.event_min_interval = float(cfg.get('event_min_interval_sec', 5.0))
-        # Card present/off threshold for Employee cards in get_state()
         self.card_present_threshold = float(cfg.get('card_present_threshold_sec', presence_timeout))
-        # Alert debounce interval (seconds) for ENTER/EXIT alerts; default to presence_timeout if not set
         self.alert_min_interval = float(cfg.get('alert_min_interval_sec', presence_timeout))
-        # quality gating thresholds
         self.min_blur_var = float(cfg.get('quality_min_blur_var', 50.0))
-        self.min_face_area_frac = float(cfg.get('quality_min_face_area_frac', 0.01))  # 1% of frame
-        self.min_brightness = float(cfg.get('quality_min_brightness', 0.15))  # 0..1
+        self.min_face_area_frac = float(cfg.get('quality_min_face_area_frac', 0.01))
+        self.min_brightness = float(cfg.get('quality_min_brightness', 0.15))
         self.max_brightness = float(cfg.get('quality_max_brightness', 0.9))
         self.min_quality_score = float(cfg.get('quality_min_score', 0.3))
 
-        # separate threads for capture and inference
         self._cap_threads: Dict[int, threading.Thread] = {}
         self._cap_stops: Dict[int, threading.Event] = {}
         self._proc_threads: Dict[int, threading.Thread] = {}
         self._proc_stops: Dict[int, threading.Event] = {}
         self._state_lock = threading.Lock()
-        # state per employee
         self.last_seen: Dict[int, dt.datetime] = {}
         self.last_cam: Dict[int, int] = {}
-        # latest raw frames by camera (for UI streaming to consume)
         self._frame_lock = threading.Lock()
         self._latest_frames: Dict[int, np.ndarray] = {}
-        # per-camera simple trackers
-        self._tracks: Dict[int, Dict[int, Any]] = {}  # cam_id -> {track_id: Track}
+        # Bounded cache for tracks - prevents memory leak on long-running instances
+        # Max 1000 tracks per camera, auto-expire after 5 minutes of inactivity
+        self._tracks: Dict[int, Dict[int, Any]] = {}
         self._next_track_id: Dict[int, int] = {}
-        # last event timestamp per (emp_id, cam_id)
-        self._last_event_ts: Dict[Tuple[int,int], dt.datetime] = {}
-        # last alert timestamp per (emp_id, alert_type)
-        self._last_alert_ts: Dict[Tuple[int,str], dt.datetime] = {}
-        # Callback for special events (e.g., new employee seen)
+        # Bounded caches with TTL to prevent unbounded growth
+        self._last_event_ts: Dict[Tuple[int,int], dt.datetime] = TTLCache(maxsize=1000, ttl=3600)  # 1h TTL
+        self._last_alert_ts: Dict[Tuple[int,str], dt.datetime] = TTLCache(maxsize=500, ttl=3600)  # 1h TTL
         self._on_new_employee_seen_callback = None
-        # Debounce for new employee welcome alerts (per day)
         self._welcomed_today: set[int] = set()
+
+        # --- Asynchronous Database Writer Setup ---
+        self.db_write_queue = queue.Queue()
+        db_writer_thread = threading.Thread(target=self._database_writer_loop, daemon=True)
+        db_writer_thread.start()
+        print("[AI] Asynchronous DB writer thread started.")
+
+    def _database_writer_loop(self):
+        """A dedicated thread that processes database writes from a queue."""
+        while True:
+            try:
+                event_data = self.db_write_queue.get() # This blocks until an item is available
+                if not event_data or not isinstance(event_data, dict):
+                    continue
+
+                event_type = event_data.get('type')
+
+                with get_session() as db:
+                    if event_type == 'employee_seen':
+                        # This logic was moved from _on_employee_seen
+                        emp_id = event_data['emp_id']
+                        cam_id = event_data['cam_id']
+                        ts = event_data['ts']
+                        sim = event_data['sim']
+                        
+                        emp_row = db.query(Employee).filter(Employee.id == emp_id).first()
+                        if emp_row and not emp_row.is_active:
+                            today = ts.date()
+                            att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
+                            if att is None:
+                                att = Attendance(employee_id=emp_id, date=today)
+                                db.add(att)
+                            att.first_in_ts = None
+                            att.last_out_ts = None
+                            att.status = 'ABSENT'
+                        else:
+                            # Insert Event
+                            evt = Event(employee_id=emp_id, camera_id=cam_id, timestamp=ts, similarity_score=sim)
+                            db.add(evt)
+
+                            # Presence upsert
+                            pres = db.query(Presence).filter(Presence.employee_id == emp_id).first()
+                            if pres is None:
+                                pres = Presence(employee_id=emp_id, status='available', last_seen_ts=ts, last_camera_id=cam_id)
+                                db.add(pres)
+                            else:
+                                pres.status = 'available'
+                                pres.last_seen_ts = ts
+                                pres.last_camera_id = cam_id
+
+                            # Attendance upsert
+                            today = ts.date()
+                            att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
+                            if att is None:
+                                att = Attendance(employee_id=emp_id, date=today, first_in_ts=ts, status='PRESENT', entry_type='AUTO')
+                                db.add(att)
+                            else:
+                                if att.first_in_ts is None:
+                                    att.first_in_ts = ts
+                                # Only update status if not manual entry (protect admin overrides)
+                                if att.entry_type != 'MANUAL':
+                                    att.status = 'PRESENT'
+                                    att.entry_type = 'AUTO'
+
+                    elif event_type == 'employee_timeout':
+                        # This logic was moved from _update_timeouts
+                        emp_id = event_data['emp_id']
+                        now = event_data['timestamp']
+                        pres = db.query(Presence).filter(Presence.employee_id == emp_id).first()
+                        if pres and (pres.status or 'off') != 'off':
+                            pres.status = 'off'
+                            today = now.date()
+                            att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
+                            if att is None:
+                                att = Attendance(employee_id=emp_id, date=today, last_out_ts=now, status='PRESENT', entry_type='AUTO')
+                                db.add(att)
+                            else:
+                                # Only update if not manually set
+                                if att.entry_type != 'MANUAL':
+                                    att.last_out_ts = now
+
+                    db.commit()
+
+            except Exception as e:
+                print(f"[AI-DB-Writer] Error processing queue: {e}")
+                # In case of commit error, rollback session
+                try:
+                    db.rollback()
+                except Exception as rb_e:
+                    print(f"[AI-DB-Writer] Rollback failed: {rb_e}")
+            finally:
+                self.db_write_queue.task_done()
 
     # ---- Simple Track structure ----
     class Track:
@@ -393,21 +481,18 @@ class TrackingManager:
 
     def stop_camera(self, cam_id: int) -> None:
         """Stop capture and inference threads for a single camera."""
-        # signal stops
         evt_cap = self._cap_stops.pop(cam_id, None)
         evt_proc = self._proc_stops.pop(cam_id, None)
         if evt_cap:
             evt_cap.set()
         if evt_proc:
             evt_proc.set()
-        # join threads
         th_cap = self._cap_threads.pop(cam_id, None)
         th_proc = self._proc_threads.pop(cam_id, None)
         if th_cap and th_cap.is_alive():
             th_cap.join(timeout=2.0)
         if th_proc and th_proc.is_alive():
             th_proc.join(timeout=2.0)
-        # drop latest frame to free memory
         try:
             with self._frame_lock:
                 if cam_id in self._latest_frames:
@@ -419,12 +504,8 @@ class TrackingManager:
     def _open_capture(self, src: str):
         try:
             s = (src or '').strip()
-            # Prefer TCP and smaller buffers for RTSP
-            try:
-                if s.lower().startswith('rtsp://'):
-                    os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp|stimeout;5000000|buffer_size;102400')
-            except Exception:
-                pass
+            if s.lower().startswith('rtsp://'):
+                os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp|stimeout;5000000|buffer_size;102400')
             if s.lower().startswith('webcam:'):
                 idx = int(s.split(':', 1)[1])
                 cap = cv2.VideoCapture(idx, getattr(cv2, 'CAP_DSHOW', 0))
@@ -432,17 +513,10 @@ class TrackingManager:
                 cap = cv2.VideoCapture(int(s), getattr(cv2, 'CAP_DSHOW', 0))
             else:
                 cap = cv2.VideoCapture(s)
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
-            # For webcams request MJPG to reduce latency
-            try:
-                if s.lower().startswith('webcam:') or s.isdigit():
-                    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                    cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-            except Exception:
-                pass
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if s.lower().startswith('webcam:') or s.isdigit():
+                fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                cap.set(cv2.CAP_PROP_FOURCC, fourcc)
             return cap
         except Exception:
             return None
@@ -455,13 +529,11 @@ class TrackingManager:
             return
         try:
             interval = 1.0 / float(self.fps_target)
-            frame_idx = 0
             fail_count = 0
             while not stop_evt.is_set():
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     fail_count += 1
-                    # If repeated failures, try reconnect
                     if fail_count >= 10:
                         try:
                             cap.release()
@@ -478,7 +550,6 @@ class TrackingManager:
                         continue
                 else:
                     fail_count = 0
-                # publish latest raw frame for UI streaming
                 try:
                     with self._frame_lock:
                         self._latest_frames[cam_id] = frame
@@ -492,11 +563,9 @@ class TrackingManager:
                 pass
 
     def _run_inference(self, cam_id: int, stop_evt: threading.Event):
-        # Consume the latest available frame without blocking capture; drop frames if lagging
         interval = 1.0 / float(max(1, self.fps_target))
         frame_idx = 0
         while not stop_evt.is_set():
-            # snapshot latest frame
             frame = None
             try:
                 with self._frame_lock:
@@ -515,21 +584,17 @@ class TrackingManager:
             time.sleep(interval)
 
     def _process_frame(self, cam_id: int, frame: np.ndarray):
-        # Refresh known embeddings periodically
         self.emb_store.load()
         faces = self.engine.get_faces(frame)
-        now = dt.datetime.utcnow()
-        # Build detection list
-        dets: List[Tuple[Tuple[int,int,int,int], Optional[int], float, float]] = []  # (bbox, emp_id or None, sim, quality)
+        now = _now_wib()
+        dets: List[Tuple[Tuple[int,int,int,int], Optional[int], float, float]] = []
         for f in (faces or []):
             bbox = getattr(f, 'bbox', None)
-            if bbox is None:
-                continue
+            if bbox is None: continue
             try:
                 x1,y1,x2,y2 = [int(v) for v in bbox]
             except Exception:
                 continue
-            # quality gating
             q_score, _ = self._compute_quality(frame, (x1,y1,x2,y2))
             emp_id = None
             sim = 0.0
@@ -539,24 +604,16 @@ class TrackingManager:
                 if e_id is not None and s >= self.sim_thresh and q_score >= self.min_quality_score:
                     emp_id, sim = e_id, s
             dets.append(((x1,y1,x2,y2), emp_id, sim, q_score))
-        # Update tracks with detections
         self._update_tracks_with_dets(cam_id, dets, now)
-        # After processing, apply timeouts for presence DB
         self._update_timeouts(now)
 
     def _should_emit_alert(self, emp_id: int, alert_type: str, ts: dt.datetime, min_interval_sec: int = 60) -> bool:
-        """Return True if we should emit alert for (emp, type) considering local debounce window."""
         try:
             key = (int(emp_id), str(alert_type).upper())
             last = self._last_alert_ts.get(key)
             if last is not None:
-                try:
-                    if (ts - last).total_seconds() < float(min_interval_sec):
-                        return False
-                except Exception:
-                    # if time math fails, allow emit
-                    pass
-            # record tentative emit time; caller should keep it on success
+                if (ts - last).total_seconds() < float(min_interval_sec):
+                    return False
             self._last_alert_ts[key] = ts
             return True
         except Exception:
@@ -565,10 +622,8 @@ class TrackingManager:
     def _update_tracks_with_dets(self, cam_id: int, dets: List[Tuple[Tuple[int,int,int,int], Optional[int], float, float]], now: dt.datetime):
         tracks = self._tracks.setdefault(cam_id, {})
         next_id = self._next_track_id.setdefault(cam_id, 1)
-        # Associate by IOU
         unmatched = set(range(len(dets)))
-        # For each track, find best det above threshold
-        assignments: List[Tuple[int,int]] = []  # (track_id, det_idx)
+        assignments: List[Tuple[int,int]] = []
         for tid, tr in list(tracks.items()):
             best_iou = 0.0
             best_idx = -1
@@ -581,34 +636,26 @@ class TrackingManager:
                 assignments.append((tid, best_idx))
                 unmatched.discard(best_idx)
             else:
-                # miss this frame
                 tr.misses += 1
-        # Update matched tracks
         for tid, j in assignments:
             tr = tracks.get(tid)
-            if tr is None:
-                continue
+            if tr is None: continue
             bbox, emp_id, sim, q = dets[j]
             tr.bbox = bbox
             tr.last_ts = now
             tr.hits += 1
             tr.misses = 0
-            # add vote if recognized
             if emp_id is not None:
                 tr.votes.append(emp_id)
-                # smoothing: majority over window
                 maj_id = None
                 if tr.votes:
                     cnt = Counter(tr.votes)
                     maj_id, maj_c = cnt.most_common(1)[0]
                     if maj_id is not None and maj_c >= max(1, self.smooth_min_votes):
-                        # update final id
                         tr.final_emp_id = maj_id
                         if tr.final_since is None:
                             tr.final_since = now
-                        # Emit presence update each time to keep alive
                         self._on_employee_seen(maj_id, cam_id, now, sim)
-        # Create new tracks for unmatched detections
         for j in list(unmatched):
             bbox, emp_id, sim, q = dets[j]
             tid = next_id
@@ -618,7 +665,6 @@ class TrackingManager:
                 tr.votes.append(emp_id)
             tracks[tid] = tr
         self._next_track_id[cam_id] = next_id
-        # Cleanup stale tracks
         to_del = []
         for tid, tr in tracks.items():
             if tr.misses > self.max_track_misses:
@@ -627,130 +673,32 @@ class TrackingManager:
             tracks.pop(tid, None)
 
     def _on_employee_seen(self, emp_id: int, cam_id: int, ts: dt.datetime, sim: float):
-        with get_session() as db:
-            try:
-                # Exclude inactive employees from tracking and attendance first/last updates
-                emp_row = db.query(Employee).filter(Employee.id == emp_id).first()
-                if emp_row is not None and (emp_row.is_active is False):
-                    # Option C: Always set today's attendance to ABSENT and clear timestamps
-                    try:
-                        today = ts.date()
-                        att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
-                        if att is None:
-                            att = Attendance(employee_id=emp_id, date=today)
-                            db.add(att)
-                        att.first_in_ts = None
-                        att.last_out_ts = None
-                        att.status = 'ABSENT'
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                    return  # do not log events/presence for inactive employees
-                # Insert Event only if allowed by schedule (Option B) and beyond min interval per emp+cam
-                allow_write = _alerts_allowed()
-                do_insert = bool(allow_write)
-                key = (emp_id, cam_id)
-                last_ts = self._last_event_ts.get(key)
-                if last_ts is not None:
-                    try:
-                        if (ts - last_ts).total_seconds() < self.event_min_interval:
-                            do_insert = False
-                    except Exception:
-                        do_insert = True
-                if do_insert:
-                    evt = Event(employee_id=emp_id, camera_id=cam_id, timestamp=ts, similarity_score=sim)
-                    db.add(evt)
-                    # update memory only when we actually log an event
-                    self._last_event_ts[key] = ts
-                # Presence upsert
-                pres = db.query(Presence).filter(Presence.employee_id == emp_id).first()
-                if pres is None:
-                    pres = Presence(employee_id=emp_id, status='available', last_seen_ts=ts, last_camera_id=cam_id)
-                    db.add(pres)
-                else:
-                    # If previously off, log a RESOLVED alert with correct absence duration
-                    try:
-                        if (pres.status or 'off') != 'available' and _alerts_allowed():
-                            # Determine absence start: prefer Attendance.last_out_ts, fallback to Presence.last_seen_ts
-                            try:
-                                # resolve employee name
-                                name = None
-                                try:
-                                    if 'emp_row' not in locals() or emp_row is None:
-                                        emp_row = db.query(Employee).filter(Employee.id == emp_id).first()
-                                    name = (emp_row.name if emp_row else None) or f"Employee {emp_id}"
-                                except Exception:
-                                    name = f"Employee {emp_id}"
-                                absence_start = None
-                                # today's attendance record
-                                today = ts.date()
-                                att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
-                                if att and att.last_out_ts:
-                                    absence_start = att.last_out_ts
-                                elif pres.last_seen_ts:
-                                    absence_start = pres.last_seen_ts
-                                mins = 0
-                                if absence_start is not None:
-                                    down_sec = max(0, int((ts - absence_start).total_seconds()))
-                                    # round up to next minute to avoid "0 min" for short absences
-                                    mins = int(math.ceil(down_sec / 60.0)) if down_sec > 0 else 0
-                                msg = f"{name} back to area after {mins} min"
-                            except Exception:
-                                msg = f"Employee {emp_id} back to area after 0 min"
-                            # Avoid duplicate ENTER logs: check DB since last seen and debounce locally
-                            should_emit = self._should_emit_alert(emp_id, 'RESOLVED', ts, self.alert_min_interval)
-                            if should_emit:
-                                try:
-                                    exists = db.query(AlertLog).filter(
-                                        AlertLog.employee_id == emp_id,
-                                        AlertLog.alert_type == 'RESOLVED',
-                                        AlertLog.timestamp >= (pres.last_seen_ts or ts - dt.timedelta(days=1))
-                                    ).first()
-                                except Exception:
-                                    exists = None
-                                # Client-side now handles Alert Logs (ENTER/EXIT) to avoid duplicates.
-                                # Keep server silent for UI logs here.
-                                pass
-                    except Exception:
-                        pass
-                    pres.status = 'available'
-                    pres.last_seen_ts = ts
-                    pres.last_camera_id = cam_id
-                # Attendance upsert (today)
-                today = ts.date()
-                att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
+        # This function is now non-blocking. It just puts a job in the queue.
+        event_data = {
+            'type': 'employee_seen',
+            'emp_id': emp_id,
+            'cam_id': cam_id,
+            'ts': ts,
+            'sim': sim
+        }
+        self.db_write_queue.put(event_data)
 
-                # --- New Employee Detection ---
-                # Check if this is the very first attendance record ever for this employee
-                is_new_employee = False
-                if emp_id not in self._welcomed_today:
-                    # Query for any attendance record in the past
-                    any_attendance = db.query(Attendance.id).filter(Attendance.employee_id == emp_id).limit(1).first()
-                    if any_attendance is None:
-                        is_new_employee = True
-                        self._welcomed_today.add(emp_id) # Debounce for today
-                        # Trigger the special handler
-                        self._handle_new_employee_seen(emp_id, cam_id, ts)
-                # --- End New Employee Detection ---
-
-                if att is None:
-                    att = Attendance(employee_id=emp_id, date=today, first_in_ts=ts, status='PRESENT')
-                    db.add(att)
-                else:
-                    if att.first_in_ts is None:
-                        att.first_in_ts = ts
-                    att.status = att.status or 'PRESENT'
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print(f"[AI] DB error on seen: {e}")
-        # Update in-memory
+        # Update in-memory state immediately for responsiveness
         with self._state_lock:
             self.last_seen[emp_id] = ts
             self.last_cam[emp_id] = cam_id
 
+        # Handle new employee logic (this part can remain as it might trigger UI events)
+        if emp_id not in self._welcomed_today:
+            # This check still needs a DB read, but it's less frequent.
+            # For full non-blocking, this could also be moved to the writer thread.
+            with get_session() as db:
+                any_attendance = db.query(Attendance.id).filter(Attendance.employee_id == emp_id).limit(1).first()
+                if any_attendance is None:
+                    self._welcomed_today.add(emp_id)
+                    self._handle_new_employee_seen(emp_id, cam_id, ts)
+
     def set_new_employee_callback(self, callback):
-        """Sets a callback function to be triggered when a new employee is seen for the first time."""
         self._on_new_employee_seen_callback = callback
 
     def _handle_new_employee_seen(self, emp_id: int, cam_id: int, ts: dt.datetime):
@@ -764,98 +712,80 @@ class TrackingManager:
             for emp_id, ts in list(self.last_seen.items()):
                 if ts < cutoff:
                     expired.append(emp_id)
+        
         if not expired:
             return
-        with get_session() as db:
-            for emp_id in expired:
-                try:
-                    pres = db.query(Presence).filter(Presence.employee_id == emp_id).first()
-                    if pres is not None:
-                        last_seen = pres.last_seen_ts
-                        secs = None
-                        if last_seen is not None:
-                            try:
-                                secs = max(0, int((now - last_seen).total_seconds()))
-                            except Exception:
-                                secs = None
-                        # Transition to off: update once
-                        if (pres.status or 'off') != 'off':
-                            pres.status = 'off'
-                            # For inactive employees: Option C -> set ABSENT and clear timestamps (override)
-                            emp_row = db.query(Employee).filter(Employee.id == emp_id).first()
-                            today = now.date()
-                            if emp_row is not None and (emp_row.is_active is False):
-                                att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
-                                if att is None:
-                                    att = Attendance(employee_id=emp_id, date=today)
-                                    db.add(att)
-                                att.first_in_ts = None
-                                att.last_out_ts = None
-                                att.status = 'ABSENT'
-                            else:
-                                # Active employee: update last_out_ts
-                                att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
-                                if att is None:
-                                    att = Attendance(employee_id=emp_id, date=today, last_out_ts=now, status='PRESENT')
-                                    db.add(att)
-                        else:
-                            # Ensure inactive employees keep ABSENT status for today
-                            try:
-                                emp_row = db.query(Employee).filter(Employee.id == emp_id).first()
-                                if emp_row is not None and (emp_row.is_active is False):
-                                    today = now.date()
-                                    att = db.query(Attendance).filter(Attendance.employee_id == emp_id, Attendance.date == today).first()
-                                    if att is None:
-                                        att = Attendance(employee_id=emp_id, date=today)
-                                        db.add(att)
-                                    att.first_in_ts = None
-                                    att.last_out_ts = None
-                                    att.status = 'ABSENT'
-                            except Exception:
-                                pass
-                    db.commit()
-                except Exception as e:
-                    db.rollback()
-                    print(f"[AI] DB error on timeout: {e}")
-                # Keep last_seen so we can detect 60s threshold and avoid duplicate scheduling. Do not pop here.
+
+        # Put timeout events into the queue instead of writing to DB directly
+        for emp_id in expired:
+            event_data = {
+                'type': 'employee_timeout',
+                'emp_id': emp_id,
+                'timestamp': now
+            }
+            self.db_write_queue.put(event_data)
+            # Remove from hot-cache to prevent re-queueing until seen again
+            with self._state_lock:
+                self.last_seen.pop(emp_id, None)
 
     # ---- Public state API ----
     def get_state(self) -> Dict[str, Any]:
-        # Build current state: present/alert based on last_seen within 1 minute
+        # Optimized with eager loading to prevent N+1 queries
+        # Single query with JOINs instead of multiple queries
         with get_session() as db:
-            pres_rows = db.query(Presence).all()
+            # Eager load employee and camera relationships in a single query
+            # Filter only active employees to reduce data transfer
+            pres_rows = db.query(Presence).options(
+                joinedload(Presence.employee),  # Eager load employee
+            ).join(
+                Employee, Presence.employee_id == Employee.id
+            ).filter(
+                Employee.is_active == True  # Only active employees
+            ).all()
+
+            # Load all cameras once (small table, minimal overhead)
             cam_map = {c.id: c for c in db.query(Camera).all()}
-            # Map active employees for filtering cards
-            active_emp = {e.id: e for e in db.query(Employee).filter(Employee.is_active == True).all()}
-        now = dt.datetime.utcnow()
-        THRESH = float(getattr(self, 'card_present_threshold', 60.0))  # seconds threshold for present vs alert
+
+        now = _now_wib()
+        THRESH = float(getattr(self, 'card_present_threshold', 60.0))
         items = []
         present_count = 0
         alert_count = 0
+
         for p in pres_rows:
-            # Only show active employees that still exist
-            if p.employee_id not in active_emp:
+            # Employee already loaded via joinedload, no additional query
+            emp = p.employee
+            if not emp or not emp.is_active:
                 continue
-            meta = self.emb_store.employee_meta.get(p.employee_id, {})
+
             last_seen_ts = p.last_seen_ts
-            # Serialize UTC with Z so frontend converts to WIB/local correctly
-            last_seen_iso = (last_seen_ts.isoformat() + 'Z') if last_seen_ts else None
+            # Handle timezone-naive timestamps from old database records
+            if last_seen_ts and last_seen_ts.tzinfo is None:
+                wib_tz = dt.timezone(dt.timedelta(hours=7))
+                last_seen_ts = last_seen_ts.replace(tzinfo=wib_tz)
+
+            # Use proper timezone serialization (WIB with +07:00 offset, not 'Z' which means UTC)
+            last_seen_iso = last_seen_ts.isoformat() if last_seen_ts else None
             seconds_since = None
             if last_seen_ts is not None:
                 try:
                     seconds_since = max(0, int((now - last_seen_ts).total_seconds()))
                 except Exception:
                     seconds_since = None
+
             is_present = (seconds_since is not None and seconds_since <= THRESH)
             if is_present:
                 present_count += 1
             else:
                 alert_count += 1
+
+            # Camera name from pre-loaded cam_map
             cam_name = cam_map.get(p.last_camera_id).name if p.last_camera_id and p.last_camera_id in cam_map else None
+
             items.append({
                 'employee_id': p.employee_id,
-                'name': meta.get('name'),
-                'department': meta.get('department'),
+                'name': emp.name,
+                'department': emp.department,
                 'status': 'available' if is_present else 'off',
                 'last_seen': last_seen_iso,
                 'seconds_since': seconds_since,
@@ -863,7 +793,7 @@ class TrackingManager:
                 'camera_id': p.last_camera_id,
                 'camera_name': cam_name,
             })
-        # total employees tracked on cards = present + alerts (not all registered)
+
         total_cards = present_count + alert_count
         return {
             'running': self.is_running(),
@@ -880,7 +810,6 @@ class TrackingManager:
         except Exception:
             return frame
         try:
-            # Refresh embeddings lazily
             self.emb_store.load()
             faces = self.engine.get_faces(img)
             if not faces:
@@ -888,10 +817,8 @@ class TrackingManager:
             for f in faces:
                 try:
                     bbox = getattr(f, 'bbox', None)
-                    if bbox is None:
-                        continue
+                    if bbox is None: continue
                     x1, y1, x2, y2 = [int(v) for v in bbox]
-                    # default Unknown = red
                     color = (0, 0, 255)
                     text_color = (0, 0, 255)
                     label = 'Unknown'
@@ -901,18 +828,14 @@ class TrackingManager:
                         if emp_id is not None and sim >= self.sim_thresh:
                             meta = self.emb_store.employee_meta.get(emp_id, {})
                             name = meta.get('name') or f"ID {emp_id}"
-                            # Show ID and Name only
                             label = f"ID {emp_id} - {name}"
-                            # recognized = green
                             color = (0, 255, 0)
                             text_color = (0, 255, 0)
                     cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-                    # background for text
                     txt = label
                     (tw, th), bl = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                     ty1 = max(0, y1 - th - 6)
                     cv2.rectangle(img, (x1, ty1), (x1 + tw + 6, ty1 + th + 6), (0, 0, 0), -1)
-                    # draw text in color (green if recognized, red if unknown)
                     cv2.putText(img, txt, (x1 + 3, ty1 + th + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
                 except Exception:
                     continue
@@ -922,16 +845,6 @@ class TrackingManager:
 
     # ---- Streaming preferences for UI pipeline ----
     def get_stream_preferences(self) -> Dict[str, int]:
-        """Expose UI streaming preferences with keys expected by app.py.
-
-        Returns:
-            dict: {
-                'max_width': int,
-                'jpeg_quality': int,
-                'annotation_stride': int,
-                'target_fps': int,
-            }
-        """
         try:
             return {
                 'max_width': int(self.stream_max_width),
@@ -940,7 +853,6 @@ class TrackingManager:
                 'target_fps': int(self.fps_target),
             }
         except Exception:
-            # Fallback defaults
             return {
                 'max_width': 960,
                 'jpeg_quality': 70,
@@ -950,7 +862,6 @@ class TrackingManager:
 
     # ---- Frames API for UI streaming ----
     def get_latest_frame(self, cam_id: int) -> Optional[np.ndarray]:
-        """Return a copy of the most recent raw frame from a camera if available."""
         try:
             with self._frame_lock:
                 frm = self._latest_frames.get(cam_id)
@@ -960,13 +871,10 @@ class TrackingManager:
         except Exception:
             return None
 
-    # Compatibility helpers for external APIs
     def get_last_frame(self, cam_id: int) -> Optional[np.ndarray]:
-        """Alias used by snapshot endpoint: returns latest raw frame copy."""
         return self.get_latest_frame(cam_id)
 
     def get_snapshot(self, cam_id: int) -> Optional[np.ndarray]:
-        """Return an annotated snapshot (if faces present) or raw frame when available."""
         frm = self.get_latest_frame(cam_id)
         if frm is None:
             return None

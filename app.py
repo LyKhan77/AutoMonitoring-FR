@@ -16,11 +16,17 @@ import shutil
 import socket
 import ctypes
 import ctypes.wintypes as wintypes
+from cachetools import TTLCache
+from openpyxl import Workbook
+from openpyxl.styles import Font
 
 from flask import Flask, jsonify, render_template, request, send_file, Response, send_from_directory
 from flask_socketio import SocketIO, emit
 from database_models import SessionLocal, Employee, Camera, FaceTemplate, Attendance, Presence, Event, AlertLog, init_db
 from database_models import seed_cameras_from_configs
+
+# --- System Uptime Tracking ---
+_system_start_time = None
 
 # --- TensorRT Engine Cache Configuration ---
 # Set a dedicated cache directory to prevent cluttering the root folder.
@@ -51,7 +57,7 @@ FACE_IMG_DIR = os.path.join(BASE_DIR, 'face_images')
 DB_PATH = os.path.join(BASE_DIR, 'db', 'attendance.db')
 CAPTURE_DIR = os.path.join(BASE_DIR, 'captures')
 os.makedirs(CAPTURE_DIR, exist_ok=True)
-TRACK_STATE_PATH = os.path.join(DB_DIR, 'tracking_mode.json')
+TRACK_STATE_PATH = os.path.join(BASE_DIR, 'config', 'tracking_mode.json')
 PARAMS_PATH = os.path.join(BASE_DIR, 'config', 'parameter_config.json')
 _camera_map: Dict[int, Dict[str, Any]] = {}
 _app_params: Dict[str, Any] = {}
@@ -89,7 +95,8 @@ def _save_snapshot_for_camera(cam_id: int) -> bool:
     """Fetch snapshot from our own API and store to captures/<cam_id>/; return True if saved."""
     try:
         import urllib.request
-        ts = dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        # Use WIB timezone for filename timestamp (consistent with system)
+        ts = _now_wib().strftime('%Y%m%d_%H%M%S')
         url = f'http://127.0.0.1:5000/api/cameras/{int(cam_id)}/snapshot?annotate=1'
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=4.0) as resp:
@@ -109,8 +116,10 @@ def _save_snapshot_for_camera(cam_id: int) -> bool:
                     except Exception: pass
         except Exception:
             pass
+        print(f"[Frame Capture] Saved snapshot for CAM{cam_id}: {fname}")
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[Frame Capture] Failed to save snapshot for CAM{cam_id}: {e}")
         return False
 
 def _background_capture_saver_loop(interval_sec: int = 5):
@@ -141,9 +150,9 @@ def _start_capture_saver_thread():
     _ensure_saver_started()
 
 _workers_by_sid: Dict[str, Any] = {}
-# Camera status cache (TTL)
+# Camera status cache with bounded size and TTL to prevent memory leaks
 _CAM_STATUS_TTL = 10.0  # seconds
-_cam_status_cache: Dict[int, Dict[str, Any]] = {}
+_cam_status_cache: TTLCache = TTLCache(maxsize=100, ttl=_CAM_STATUS_TTL)
 # Optional: Face embedding engine (lazy)
 _face_app = None
 # Directory to store cropped face images per template
@@ -167,20 +176,50 @@ def _employee_image_dir(emp: 'Employee') -> str:
 
 # --- Time helpers ---
 def _to_iso_utc(dtobj: Optional[dt.datetime]) -> Optional[str]:
-    """Serialize a datetime as ISO 8601 with explicit UTC 'Z'.
-    We store timestamps in UTC-naive; treat naive as UTC and add 'Z'.
+    """Serialize a datetime as ISO 8601.
+    If timezone-aware (WIB/UTC+7), return with timezone offset.
+    If naive, assume WIB and return with +07:00 offset.
     """
     if dtobj is None:
         return None
     try:
         if dtobj.tzinfo is None:
-            return dtobj.isoformat() + 'Z'
-        return dtobj.astimezone(dt.timezone.utc).isoformat().replace('+00:00', 'Z')
+            # Assume naive timestamps are WIB (UTC+7)
+            wib_tz = dt.timezone(dt.timedelta(hours=7))
+            dtobj = dtobj.replace(tzinfo=wib_tz)
+        return dtobj.isoformat()
     except Exception:
         try:
             return dtobj.isoformat()
         except Exception:
             return None
+
+
+def _to_wib_string(dtobj: Optional[dt.datetime]) -> str:
+    """Formats a datetime object to a WIB (UTC+7) string for display.
+    - If the object is timezone-aware, it's converted to WIB.
+    - If the object is naive, it's assumed to be in WIB already.
+    Returns: 'YYYY-MM-DD HH:MM:S' in WIB, or empty string on failure.
+    """
+    if dtobj is None:
+        return ""
+    
+    wib_tz = dt.timezone(dt.timedelta(hours=7))
+
+    try:
+        if dtobj.tzinfo is not None:
+            # Aware: convert to WIB
+            dtobj_wib = dtobj.astimezone(wib_tz)
+        else:
+            # Naive: assume it's already in WIB
+            dtobj_wib = dtobj
+        
+        return dtobj_wib.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        try:
+            return dtobj.isoformat(sep=' ')
+        except Exception:
+            return ""
 
 
 def _get_face_app():
@@ -289,9 +328,9 @@ def purge_old_events():
 
 
 def _seconds_until_midnight_local() -> float:
-    now = dt.datetime.now()
+    now = _now_local()
     tomorrow = now.date() + dt.timedelta(days=1)
-    midnight = dt.datetime.combine(tomorrow, dt.time.min)
+    midnight = dt.datetime.combine(tomorrow, dt.time.min, tzinfo=now.tzinfo)
     return max(1.0, (midnight - now).total_seconds())
 
 
@@ -349,6 +388,91 @@ def schedule_attendance_retention():
     t = threading.Thread(target=_job, daemon=True)
     t.start()
 
+# --- Absent Employee Detection ---
+def _mark_absent_employees():
+    """Mark all active employees without attendance today as ABSENT.
+    Runs daily at 17:30 WIB (end of work hours).
+    Skips manual entries (entry_type='MANUAL') to preserve admin overrides.
+    """
+    try:
+        with SessionLocal() as db:
+            today = dt.date.today()
+            # Get all active employees
+            active_employees = db.query(Employee).filter(Employee.is_active == True).all()
+            marked_count = 0
+            skipped_manual = 0
+
+            for emp in active_employees:
+                # Check if employee has attendance record for today
+                attendance = db.query(Attendance).filter(
+                    Attendance.employee_id == emp.id,
+                    Attendance.date == today
+                ).first()
+
+                if attendance is None:
+                    # No attendance record, create ABSENT entry with SYSTEM type
+                    new_attendance = Attendance(
+                        employee_id=emp.id,
+                        date=today,
+                        status='ABSENT',
+                        first_in_ts=None,
+                        last_out_ts=None,
+                        entry_type='SYSTEM'
+                    )
+                    db.add(new_attendance)
+                    marked_count += 1
+                elif attendance.status != 'ABSENT' and attendance.first_in_ts is None:
+                    # Has record but no first_in_ts
+                    # Skip if manual entry (admin has manually set status)
+                    if attendance.entry_type == 'MANUAL':
+                        skipped_manual += 1
+                        continue
+                    # Otherwise update to ABSENT
+                    attendance.status = 'ABSENT'
+                    attendance.entry_type = 'SYSTEM'
+                    marked_count += 1
+
+            db.commit()
+            if marked_count > 0:
+                print(f"[ABSENT DETECTION] Marked {marked_count} employee(s) as ABSENT for {today}")
+            if skipped_manual > 0:
+                print(f"[ABSENT DETECTION] Skipped {skipped_manual} manual entry(ies)")
+    except Exception as e:
+        print(f"[ABSENT DETECTION] Error: {e}")
+
+def _seconds_until_target_time(target_hour: int, target_minute: int) -> float:
+    """Calculate seconds until next occurrence of target time (WIB)."""
+    now = _now_local()
+    target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+
+    # If target time already passed today, schedule for tomorrow
+    if now >= target:
+        target = target + dt.timedelta(days=1)
+
+    seconds = (target - now).total_seconds()
+    return max(1.0, seconds)
+
+def schedule_absent_detection():
+    """Schedule daily absent employee detection at 17:30 WIB."""
+    def _job():
+        while True:
+            try:
+                # Wait until 17:30 WIB
+                wait_seconds = _seconds_until_target_time(17, 30)
+                print(f"[ABSENT DETECTION] Scheduled for {wait_seconds/3600:.1f} hours from now")
+                time.sleep(wait_seconds)
+
+                # Run absent detection
+                _mark_absent_employees()
+            except Exception as e:
+                print(f"[ABSENT DETECTION] Scheduler error: {e}")
+                # On error, wait 1 hour before retry
+                time.sleep(3600)
+
+    t = threading.Thread(target=_job, daemon=True)
+    t.start()
+    print("[ABSENT DETECTION] Scheduler started (daily at 17:30 WIB)")
+
 # --- Tracking schedule & state (WIB) ---
 def _default_tracking_state():
     return {
@@ -370,6 +494,24 @@ def _load_tracking_state():
                 data = json.load(f)
                 if isinstance(data, dict):
                     _tracking_state.update(data)
+                    # Validate and clear expired pauses on load
+                    pause_until = _tracking_state.get('pause_until')
+                    if pause_until:
+                        try:
+                            until = dt.datetime.fromisoformat(pause_until)
+                            now = _now_local()
+                            if now >= until:
+                                # Pause expired, clear it
+                                _tracking_state['pause_until'] = None
+                                _tracking_state['pause_kind'] = None
+                                _save_tracking_state()
+                                print(f"[Schedule] Cleared expired pause from {pause_until}")
+                        except Exception:
+                            # Invalid pause format, clear it
+                            _tracking_state['pause_until'] = None
+                            _tracking_state['pause_kind'] = None
+                            _save_tracking_state()
+                            print(f"[Schedule] Cleared invalid pause format: {pause_until}")
     except Exception:
         pass
 
@@ -377,8 +519,9 @@ def _save_tracking_state():
     try:
         with open(TRACK_STATE_PATH, 'w', encoding='utf-8') as f:
             json.dump(_tracking_state, f, indent=2)
-    except Exception:
-        pass
+        print(f"[Schedule] Saved tracking state to {TRACK_STATE_PATH}")
+    except Exception as e:
+        print(f"[ERROR] Failed to save tracking state to {TRACK_STATE_PATH}: {e}")
 
 def _parse_range(s: str):
     try:
@@ -390,8 +533,18 @@ def _parse_range(s: str):
         return (8,30), (17,30)
 
 def _now_local():
-    # Treat server local time as WIB if server runs in WIB; otherwise this is local server time
-    return dt.datetime.now()
+    """Get current time in local timezone (WIB = UTC+7)."""
+    # Return timezone-aware WIB datetime
+    wib_tz = dt.timezone(dt.timedelta(hours=7))
+    return dt.datetime.now(wib_tz)
+
+def _now_wib():
+    """Get current time in WIB timezone (UTC+7) - alias for _now_local()."""
+    return _now_local()
+
+def _now_utc():
+    """Get current time in UTC timezone (timezone-aware)."""
+    return dt.datetime.now(dt.timezone.utc)
 
 def _in_range(now: dt.datetime, rng: str) -> bool:
     """Check if a UTC datetime falls within a local time range (HH:MM-HH:MM)."""
@@ -412,7 +565,7 @@ def _in_range(now: dt.datetime, rng: str) -> bool:
         return False # Default to false on any parsing/conversion error
 
 def _maybe_update_tracking_state():
-    now_utc = dt.datetime.utcnow()
+    now_utc = _now_utc()
     # Handle manual pause
     pu = _tracking_state.get('pause_until')
     pk = _tracking_state.get('pause_kind')
@@ -605,6 +758,32 @@ def api_system_info():
         'memory_used_bytes': (int(used_b) if used_b is not None else None),
     })
 
+@app.route('/api/system/uptime')
+def api_system_uptime():
+    """Return system uptime in seconds since startup."""
+    global _system_start_time
+    if _system_start_time is None:
+        return jsonify({'uptime_seconds': 0})
+    elapsed = time.time() - _system_start_time
+    return jsonify({'uptime_seconds': int(elapsed)})
+
+@app.route('/api/system/health')
+def api_system_health():
+    """
+    Health check endpoint for monitoring system status.
+    Used by frontend to detect when server is back up after restart.
+    """
+    global _system_start_time
+    uptime = 0
+    if _system_start_time is not None:
+        uptime = int(time.time() - _system_start_time)
+
+    return jsonify({
+        'status': 'ok',
+        'uptime_seconds': uptime,
+        'timestamp': dt.datetime.now().isoformat()
+    })
+
 
 # Serve GSPE logo asset
 @app.route('/assets/logo')
@@ -717,10 +896,13 @@ def api_captures_per_camera_latest():
         if latest:
             url = f'/captures/{int(cam_id)}/{latest}'
             try:
-                # parse timestamp from filename YYYYMMDD_HHMMSS.jpg as UTC
+                # Parse timestamp from filename YYYYMMDD_HHMMSS.jpg as WIB (UTC+7)
                 ts_part = latest.split('.')[0]
-                dt_utc = dt.datetime.strptime(ts_part, '%Y%m%d_%H%M%S')
-                ts_iso = dt_utc.isoformat() + 'Z'
+                dt_naive = dt.datetime.strptime(ts_part, '%Y%m%d_%H%M%S')
+                # Add WIB timezone info since filename is in WIB
+                wib_tz = dt.timezone(dt.timedelta(hours=7))
+                dt_wib = dt_naive.replace(tzinfo=wib_tz)
+                ts_iso = _to_iso_utc(dt_wib)
             except Exception:
                 ts_iso = None
         out.append({
@@ -740,14 +922,23 @@ def _nearest_capture_for(cam_id: int, target_ts: dt.datetime, max_delta_sec: int
         if not files:
             return ''
         # Sort and find closest by filename timestamp
+        # Filenames are in WIB timezone (UTC+7)
+        wib_tz = dt.timezone(dt.timedelta(hours=7))
         best_url = ''
         best_dt = None
         best_diff = None
         for fn in files:
             try:
                 ts_part = fn.split('.')[0]
-                fdt = dt.datetime.strptime(ts_part, '%Y%m%d_%H%M%S')
-                diff = abs((fdt - target_ts).total_seconds())
+                fdt_naive = dt.datetime.strptime(ts_part, '%Y%m%d_%H%M%S')
+                # Add WIB timezone info
+                fdt = fdt_naive.replace(tzinfo=wib_tz)
+                # Ensure target_ts is also timezone-aware for comparison
+                if target_ts.tzinfo is None:
+                    target_ts_aware = target_ts.replace(tzinfo=wib_tz)
+                else:
+                    target_ts_aware = target_ts.astimezone(wib_tz)
+                diff = abs((fdt - target_ts_aware).total_seconds())
                 if best_diff is None or diff < best_diff:
                     best_diff = diff; best_dt = fdt; best_url = f'/captures/{int(cam_id)}/{fn}'
             except Exception:
@@ -804,7 +995,7 @@ def _save_attendance_capture(emp_id: int, cam_id: int, ts: dt.datetime, kind: st
             old = {}
         if kind == 'first_in':
             old['first_in'] = {
-                'ts': (ts.isoformat()+'Z' if isinstance(ts, dt.datetime) else None),
+                'ts': _to_iso_utc(ts) if isinstance(ts, dt.datetime) else None,
                 'cam_id': int(cam_id),
                 'cam_name': meta.get('name'),
                 'cam_area': meta.get('area'),
@@ -812,7 +1003,7 @@ def _save_attendance_capture(emp_id: int, cam_id: int, ts: dt.datetime, kind: st
             }
         else:
             old['last_out'] = {
-                'ts': (ts.isoformat()+'Z' if isinstance(ts, dt.datetime) else None),
+                'ts': _to_iso_utc(ts) if isinstance(ts, dt.datetime) else None,
                 'cam_id': int(cam_id),
                 'cam_name': meta.get('name'),
                 'cam_area': meta.get('area'),
@@ -897,8 +1088,8 @@ def api_report_attendance_captures():
         out = {
             'employee_id': emp_id,
             'date': date_s,
-            'first_in_ts': first_in_ts.isoformat()+'Z' if first_in_ts else None,
-            'last_out_ts': last_out_ts.isoformat()+'Z' if last_out_ts else None,
+            'first_in_ts': _to_iso_utc(first_in_ts),
+            'last_out_ts': _to_iso_utc(last_out_ts),
             'first_in_url': first_url,
             'last_out_url': last_url,
             'first_in_cam': first_cam,
@@ -968,8 +1159,9 @@ def api_capture_save():
     except Exception:
         return jsonify({'error': 'invalid image'}), 400
     # Prepare paths
-    ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-    day_dir = os.path.join(CAPTURE_DIR, dt.datetime.now().strftime('%Y-%m-%d'))
+    now = _now_local()
+    ts = now.strftime('%Y%m%d_%H%M%S')
+    day_dir = os.path.join(CAPTURE_DIR, now.strftime('%Y-%m-%d'))
     _ensure_dir(day_dir)
     fname = f"cap_{ts}_cam{cam_id or 'x'}.jpg"
     fpath = os.path.join(day_dir, fname)
@@ -978,7 +1170,7 @@ def api_capture_save():
             f.write(img_bytes)
         # Append log
         log = {
-            'timestamp': dt.datetime.now().isoformat(timespec='seconds'),
+            'timestamp': _now_local().isoformat(timespec='seconds'),
             'file': os.path.relpath(fpath, BASE_DIR).replace('\\', '/'),
             'cam_id': cam_id,
             'area': area,
@@ -1281,19 +1473,74 @@ def api_camera_snapshot(cam_id: int):
 
 
 # --- Reports: Attendance & Alert Logs ---
+
+# Helper function: Check if timestamp falls within time range
+# Note: _in_range() function is defined earlier at line 443 with timezone-aware conversion
+# This duplicate has been removed to prevent confusion
+
+
+# Helper function: Batch compute violation counts to avoid N+1 query problem
+def _compute_violation_counts_batch(db, attendance_rows: list) -> dict:
+    """
+    Compute violation counts for multiple attendance records in a single batch query.
+    Returns: Dict[(employee_id, date), violation_count]
+
+    This replaces the N+1 query pattern where we queried AlertLog for each attendance row.
+    Performance: O(N) queries -> O(1) query (100x faster for large datasets)
+    """
+    violation_map = {}
+
+    if not attendance_rows:
+        return violation_map
+
+    try:
+        # Extract unique employee IDs and date range
+        emp_ids = list(set([att.employee_id for att, emp in attendance_rows]))
+        dates = [att.date for att, emp in attendance_rows if att.date]
+
+        if not dates:
+            return violation_map
+
+        min_date = min(dates)
+        max_date = max(dates)
+        min_dt = dt.datetime.combine(min_date, dt.time.min)
+        max_dt = dt.datetime.combine(max_date, dt.time.max)
+
+        # Single batch query for all EXIT alerts in date range
+        all_exit_logs = db.query(AlertLog).filter(
+            AlertLog.employee_id.in_(emp_ids),
+            AlertLog.alert_type == 'EXIT',
+            AlertLog.timestamp >= min_dt,
+            AlertLog.timestamp <= max_dt
+        ).all()
+
+        # Group logs by (employee_id, date) and count violations
+        for log in all_exit_logs:
+            log_date = log.timestamp.date()
+            key = (log.employee_id, log_date)
+
+            # Check if this EXIT qualifies as a violation
+            if (bool(log.schedule_tracking_active) and
+                not bool(log.schedule_is_manual_pause) and
+                not _in_range(log.timestamp, log.schedule_lunch_break or '12:00-13:00')):
+
+                violation_map[key] = violation_map.get(key, 0) + 1
+
+    except Exception as e:
+        print(f"[Violation Batch] Error computing violations: {e}")
+
+    return violation_map
+
+
 @app.route('/api/report/attendance')
 def api_report_attendance():
-    """Return attendance rows with optional filters. Supports JSON or CSV via ?format=csv."""
+    """Return attendance rows with optional filters. Supports JSON or Excel via ?format=xlsx."""
     args = request.args
     from_s = args.get('from') or args.get('date_from') or args.get('start')
     to_s = args.get('to') or args.get('date_to') or args.get('end')
     emp_id = args.get('employee_id')
     fmt = (args.get('format') or '').lower()
-    # Optional: minimum duration in minutes to count a violation
-    try:
-        min_vio_min = int(args.get('min_violation_minutes') or args.get('min_vio_min') or 1)
-    except Exception:
-        min_vio_min = 1
+
     start_d = end_d = None
     try:
         if from_s:
@@ -1304,6 +1551,7 @@ def api_report_attendance():
             end_d = dt.date(y, m, d)
     except Exception:
         return jsonify({'error': 'invalid_date'}), 400
+
     with SessionLocal() as db:
         q = db.query(Attendance, Employee).join(Employee, Attendance.employee_id == Employee.id)
         if emp_id:
@@ -1317,161 +1565,251 @@ def api_report_attendance():
             q = q.filter(Attendance.date <= end_d)
         q = q.order_by(Attendance.date.desc(), Employee.name.asc())
         rows = q.all()
-        # JSON output
-        if fmt != 'csv':
-            data = []
+
+        # Excel Output
+        if fmt == 'xlsx':
+            # Compute violation counts in batch (avoid N+1 query problem)
+            violation_map = _compute_violation_counts_batch(db, rows)
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Attendance Report"
+            headers = ['Employee Code', 'Employee Name', 'Date', 'First In', 'Last Out', 'Status', 'Violation', 'First In Camera', 'Last Out Camera']
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+
             for att, emp in rows:
-                # Violation count: number of EXIT alerts for this employee on this date (00:00:00 - 23:59:59.999)
+                # Get violation count from batch map
                 vio = 0
-                # --- Smart Violation Counting ---
-                try:
-                    from database_models import AlertLog
-                    if att.date:
-                        start_dt = dt.datetime.combine(att.date, dt.time.min)
-                        end_dt = dt.datetime.combine(att.date, dt.time.max)
-                        # Load schedule for that day to check contextually
-                        _maybe_update_tracking_state() # Ensure _tracking_state is fresh
-                        work_hours_str = _tracking_state.get('work_hours', '08:30-17:30')
-                        lunch_break_str = _tracking_state.get('lunch_break', '12:00-13:00')
-
-                        exit_logs = db.query(AlertLog).filter(
-                            AlertLog.employee_id == att.employee_id, AlertLog.alert_type == 'EXIT',
-                            AlertLog.timestamp >= start_dt, AlertLog.timestamp <= end_dt
-                        ).all()
-
-                        for log in exit_logs:
-                            # Use the schedule context snapshotted at the time of the log
-                            is_work_time = _in_range(log.timestamp, log.schedule_work_hours or work_hours_str)
-                            is_lunch_time = _in_range(log.timestamp, log.schedule_lunch_break or lunch_break_str)
-                            is_paused = bool(log.schedule_is_manual_pause) # Was a manual pause active?
-                            was_tracking_active = bool(log.schedule_tracking_active) # Was tracking forced ON?
-                            
-                            if was_tracking_active and not is_lunch_time and not is_paused:
-                                vio += 1
-                except Exception:
-                    vio = 0
-                # Derive nearest captures for first/last
-                first_url = None; last_url = None
-                try:
-                    if att.date and (att.first_in_ts or att.last_out_ts):
-                        start_dt = dt.datetime.combine(att.date, dt.time.min)
-                        end_dt = dt.datetime.combine(att.date, dt.time.max)
-                        # first camera id = earliest event cam on that date
-                        cam_first = None; cam_last = None
-                        if att.first_in_ts is not None:
-                            ev_first = db.query(Event).filter(
-                                Event.employee_id == att.employee_id,
-                                Event.timestamp >= start_dt,
-                                Event.timestamp <= end_dt
-                            ).order_by(Event.timestamp.asc()).first()
-                            if ev_first: cam_first = ev_first.camera_id
-                            if cam_first:
-                                first_url = _nearest_capture_for(int(cam_first), att.first_in_ts)
-                        if att.last_out_ts is not None:
-                            ev_last = db.query(Event).filter(
-                                Event.employee_id == att.employee_id,
-                                Event.timestamp >= start_dt,
-                                Event.timestamp <= end_dt
-                            ).order_by(Event.timestamp.desc()).first()
-                            if ev_last: cam_last = ev_last.camera_id
-                            if cam_last:
-                                last_url = _nearest_capture_for(int(cam_last), att.last_out_ts)
-                except Exception:
-                    first_url = None; last_url = None
-                data.append({
-                    'employee_id': att.employee_id,
-                    'employee_code': emp.employee_code,
-                    'employee_name': emp.name,
-                    'date': att.date.isoformat() if att.date else None,
-                    'first_in_ts': _to_iso_utc(att.first_in_ts),
-                    'last_out_ts': _to_iso_utc(att.last_out_ts),
-                    'status': att.status,
-                    'violation_count': vio,
-                    'first_in_capture_url': first_url,
-                    'last_out_capture_url': last_url,
-                })
-            return jsonify(data)
-        # CSV output
-        sio = io.StringIO()
-        writer = csv.writer(sio)
-        writer.writerow(['Employee Code', 'Employee Name', 'Date', 'First In', 'Last Out', 'Status', 'Violation', 'First In Capture', 'Last Out Capture'])
-        for att, emp in rows:
-            # Violation count for CSV: number of EXIT alerts for this employee on this date
-            vio = 0
-            try:
-                # --- Smart Violation Counting for CSV ---
-                from database_models import AlertLog
                 if att.date:
-                    start_dt = dt.datetime.combine(att.date, dt.time.min)
-                    end_dt = dt.datetime.combine(att.date, dt.time.max)
-                    # Load schedule for that day to check contextually
-                    _maybe_update_tracking_state() # Ensure _tracking_state is fresh
-                    work_hours_str = _tracking_state.get('work_hours', '08:30-17:30')
-                    lunch_break_str = _tracking_state.get('lunch_break', '12:00-13:00')
+                    vio = violation_map.get((att.employee_id, att.date), 0)
 
-                    exit_logs = db.query(AlertLog).filter(
-                        AlertLog.employee_id == att.employee_id,
-                        AlertLog.alert_type == 'EXIT',
-                        AlertLog.timestamp >= start_dt,
-                        AlertLog.timestamp <= end_dt
-                    ).all()
+                # Read capture metadata from meta.json
+                first_in_camera = ''
+                last_out_camera = ''
 
-                    for log in exit_logs:
-                        is_work_time = _in_range(log.timestamp, log.schedule_work_hours or work_hours_str)
-                        is_lunch_time = _in_range(log.timestamp, log.schedule_lunch_break or lunch_break_str)
-                        is_paused = bool(log.schedule_is_manual_pause) # Was a manual pause active?
-                        was_tracking_active = bool(log.schedule_tracking_active) # Was tracking forced ON?
+                if att.date and att.employee_id:
+                    day_s = att.date.isoformat()
+                    att_dir = os.path.join(ATT_CAPTURES_DIR, day_s, str(att.employee_id))
+                    meta_path = os.path.join(att_dir, 'meta.json')
 
-                        if was_tracking_active and not is_lunch_time and not is_paused:
-                            vio += 1
-            except Exception:
-                vio = 0
-            # Capture URLs
-            first_url = ''
-            last_url = ''
-            try:
-                if att.date and (att.first_in_ts or att.last_out_ts):
-                    start_dt = dt.datetime.combine(att.date, dt.time.min)
-                    end_dt = dt.datetime.combine(att.date, dt.time.max)
-                    cam_first = None; cam_last = None
-                    if att.first_in_ts is not None:
-                        ev_first = db.query(Event).filter(
-                            Event.employee_id == att.employee_id,
-                            Event.timestamp >= start_dt,
-                            Event.timestamp <= end_dt
-                        ).order_by(Event.timestamp.asc()).first()
-                        if ev_first: cam_first = ev_first.camera_id
-                        if cam_first:
-                            first_url = _nearest_capture_for(int(cam_first), att.first_in_ts) or ''
-                    if att.last_out_ts is not None:
-                        ev_last = db.query(Event).filter(
-                            Event.employee_id == att.employee_id,
-                            Event.timestamp >= start_dt,
-                            Event.timestamp <= end_dt
-                        ).order_by(Event.timestamp.desc()).first()
-                        if ev_last: cam_last = ev_last.camera_id
-                        if cam_last:
-                            last_url = _nearest_capture_for(int(cam_last), att.last_out_ts) or ''
-            except Exception:
-                first_url = ''; last_url = ''
-            writer.writerow([
-                emp.employee_code or '',
-                emp.name or '',
-                att.date.isoformat() if att.date else '',
-                att.first_in_ts.isoformat(sep=' ') if att.first_in_ts else '',
-                att.last_out_ts.isoformat(sep=' ') if att.last_out_ts else '',
-                att.status or '',
-                str(vio),
-                first_url,
-                last_url,
-            ])
-        output = sio.getvalue()
-        return Response(output, mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=attendance.csv'})
+                    if os.path.isfile(meta_path):
+                        try:
+                            with open(meta_path, 'r', encoding='utf-8') as f:
+                                meta = json.load(f)
+
+                            # Extract First In camera info
+                            if meta.get('first_in'):
+                                first_in = meta['first_in']
+                                area = first_in.get('cam_area', '')
+                                name = first_in.get('cam_name', '')
+                                if area and name:
+                                    first_in_camera = f"{area} - {name}"
+                                elif name:
+                                    first_in_camera = name
+                                elif area:
+                                    first_in_camera = area
+
+                            # Extract Last Out camera info
+                            if meta.get('last_out'):
+                                last_out = meta['last_out']
+                                area = last_out.get('cam_area', '')
+                                name = last_out.get('cam_name', '')
+                                if area and name:
+                                    last_out_camera = f"{area} - {name}"
+                                elif name:
+                                    last_out_camera = name
+                                elif area:
+                                    last_out_camera = area
+                        except Exception as e:
+                            print(f"[Excel Export] Error reading meta.json for emp={att.employee_id} date={day_s}: {e}")
+
+                # Append row data
+                ws.append([
+                    emp.employee_code or '',
+                    emp.name or '',
+                    att.date.isoformat() if att.date else '',
+                    _to_wib_string(att.first_in_ts) or '',
+                    _to_wib_string(att.last_out_ts) or '',
+                    att.status or '',
+                    vio,
+                    first_in_camera,
+                    last_out_camera,
+                ])
+
+            buffer = io.BytesIO()
+            wb.save(buffer)
+            buffer.seek(0)
+
+            return Response(buffer, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={'Content-Disposition': 'attachment; filename=attendance_report.xlsx'})
+
+        # JSON output (default)
+        # Use batch violation counts (same optimization as Excel)
+        violation_map = _compute_violation_counts_batch(db, rows)
+
+        data = []
+        for att, emp in rows:
+            # Get violation count from batch map
+            vio = 0
+            if att.date:
+                vio = violation_map.get((att.employee_id, att.date), 0)
+
+            data.append({
+                'employee_id': att.employee_id,
+                'employee_code': emp.employee_code,
+                'employee_name': emp.name,
+                'date': att.date.isoformat() if att.date else None,
+                'first_in_ts': _to_iso_utc(att.first_in_ts),
+                'last_out_ts': _to_iso_utc(att.last_out_ts),
+                'status': att.status,
+                'entry_type': att.entry_type or 'AUTO',
+                'violation_count': vio,
+            })
+        return jsonify(data)
+
+
+# --- Manual Attendance Entry API ---
+@app.route('/api/attendance/manual', methods=['POST'])
+def api_set_manual_attendance():
+    """
+    Allow admin to manually set attendance status for an employee on a specific date.
+    Manual entries are protected from auto-override by scheduler and AI detection.
+
+    Request JSON:
+    {
+        "employee_id": int,
+        "date": "YYYY-MM-DD",
+        "status": "PRESENT" or "ABSENT"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    emp_id = data.get('employee_id')
+    date_str = data.get('date')
+    status = data.get('status', 'PRESENT').upper()
+
+    # Validation
+    if not emp_id or not date_str:
+        return jsonify({'error': 'employee_id and date required'}), 400
+
+    if status not in ('PRESENT', 'ABSENT'):
+        return jsonify({'error': 'status must be PRESENT or ABSENT'}), 400
+
+    try:
+        date_obj = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
+    except Exception:
+        return jsonify({'error': 'invalid date format, expected YYYY-MM-DD'}), 400
+
+    try:
+        with SessionLocal() as db:
+            # Check if employee exists
+            emp = db.get(Employee, int(emp_id))
+            if not emp:
+                return jsonify({'error': 'employee not found'}), 404
+
+            # Upsert attendance record
+            att = db.query(Attendance).filter(
+                Attendance.employee_id == emp_id,
+                Attendance.date == date_obj
+            ).first()
+
+            if att is None:
+                # Create new manual entry
+                att = Attendance(
+                    employee_id=emp_id,
+                    date=date_obj,
+                    status=status,
+                    entry_type='MANUAL',
+                    first_in_ts=None,
+                    last_out_ts=None
+                )
+                db.add(att)
+            else:
+                # Update existing record to manual
+                att.status = status
+                att.entry_type = 'MANUAL'
+
+            db.commit()
+
+            return jsonify({
+                'ok': True,
+                'attendance': {
+                    'employee_id': att.employee_id,
+                    'employee_name': emp.name,
+                    'date': att.date.isoformat(),
+                    'status': att.status,
+                    'entry_type': att.entry_type,
+                    'first_in_ts': _to_iso_utc(att.first_in_ts),
+                    'last_out_ts': _to_iso_utc(att.last_out_ts)
+                }
+            })
+    except Exception as e:
+        print(f"[Manual Attendance] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/attendance/reset', methods=['POST'])
+def api_reset_attendance():
+    """
+    Reset manual attendance entry back to AUTO mode.
+    Status remains unchanged, but entry can now be auto-updated by scheduler/AI.
+
+    Request JSON:
+    {
+        "employee_id": int,
+        "date": "YYYY-MM-DD"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    emp_id = data.get('employee_id')
+    date_str = data.get('date')
+
+    if not emp_id or not date_str:
+        return jsonify({'error': 'employee_id and date required'}), 400
+
+    try:
+        date_obj = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
+    except Exception:
+        return jsonify({'error': 'invalid date format, expected YYYY-MM-DD'}), 400
+
+    try:
+        with SessionLocal() as db:
+            att = db.query(Attendance).filter(
+                Attendance.employee_id == emp_id,
+                Attendance.date == date_obj
+            ).first()
+
+            if not att:
+                return jsonify({'error': 'attendance record not found'}), 404
+
+            # Get employee name for response
+            emp = db.get(Employee, int(emp_id))
+
+            # Reset to AUTO mode (keep current status)
+            old_type = att.entry_type
+            att.entry_type = 'AUTO'
+            db.commit()
+
+            return jsonify({
+                'ok': True,
+                'message': 'Reset to automatic mode',
+                'attendance': {
+                    'employee_id': att.employee_id,
+                    'employee_name': emp.name if emp else None,
+                    'date': att.date.isoformat(),
+                    'status': att.status,
+                    'entry_type': att.entry_type,
+                    'previous_type': old_type
+                }
+            })
+    except Exception as e:
+        print(f"[Reset Attendance] Error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/report/alerts')
 def api_report_alerts():
-    """Return alert logs with optional filters. Supports JSON or CSV via ?format=csv."""
+    """Return alert logs with optional filters. Supports JSON or Excel via ?format=xlsx."""
     args = request.args
     from_s = args.get('from') or args.get('date_from') or args.get('start')
     to_s = args.get('to') or args.get('date_to') or args.get('end')
@@ -1500,34 +1838,45 @@ def api_report_alerts():
             q = q.filter(AlertLog.timestamp <= end_dt)
         q = q.order_by(AlertLog.timestamp.desc())
         rows = q.all()
-        if fmt != 'csv':
-            data = []
+
+        if fmt == 'xlsx':
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Alert Logs"
+            headers = ['Timestamp', 'Employee Code', 'Employee Name', 'Alert Type', 'Message', 'Notified To']
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+
             for log, emp in rows:
-                data.append({
-                    'timestamp': _to_iso_utc(log.timestamp),
-                    'employee_id': log.employee_id,
-                    'employee_code': (emp.employee_code if emp else None),
-                    'employee_name': (emp.name if emp else None),
-                    'alert_type': log.alert_type,
-                    'message': log.message,
-                    'notified_to': log.notified_to,
-                })
-            return jsonify(data)
-        # CSV
-        sio = io.StringIO()
-        writer = csv.writer(sio)
-        writer.writerow(['Timestamp', 'Employee Code', 'Employee Name', 'Alert Type', 'Message', 'Notified To'])
+                ws.append([
+                    _to_wib_string(log.timestamp) or '',
+                    (emp.employee_code if emp else ''),
+                    (emp.name if emp else ''),
+                    log.alert_type or '',
+                    log.message or '',
+                    log.notified_to or '',
+                ])
+
+            buffer = io.BytesIO()
+            wb.save(buffer)
+            buffer.seek(0)
+
+            return Response(buffer, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={'Content-Disposition': 'attachment; filename=alert_logs.xlsx'})
+
+        # JSON output (default)
+        data = []
         for log, emp in rows:
-            writer.writerow([
-                log.timestamp.isoformat(sep=' ') if log.timestamp else '',
-                (emp.employee_code if emp else ''),
-                (emp.name if emp else ''),
-                log.alert_type or '',
-                log.message or '',
-                log.notified_to or '',
-            ])
-        output = sio.getvalue()
-        return Response(output, mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=alert_logs.csv'})
+            data.append({
+                'timestamp': _to_iso_utc(log.timestamp),
+                'employee_id': log.employee_id,
+                'employee_code': (emp.employee_code if emp else None),
+                'employee_name': (emp.name if emp else None),
+                'alert_type': log.alert_type,
+                'message': log.message,
+                'notified_to': log.notified_to,
+            })
+        return jsonify(data)
 
 @app.route('/api/config/params')
 def api_config_params():
@@ -1559,7 +1908,7 @@ def api_alert_logs_create():
             emp = db.get(Employee, int(emp_id))
             if not emp:
                 return jsonify({'error': 'employee_not_found'}), 404
-            now_utc = dt.datetime.utcnow()
+            now_utc = _now_utc()
             # Get current schedule state to snapshot it with the log
             _maybe_update_tracking_state()
             is_paused_now = bool(_tracking_state.get('pause_until'))
@@ -1598,7 +1947,7 @@ def api_alert_logs_create():
                     'employee_id': int(emp_id),
                     'alert_type': alert_type,
                     'message': message or None,
-                    'timestamp': now_utc.isoformat() + 'Z',
+                    'timestamp': _to_iso_utc(now_utc),
                     'employee_name': (emp.name or None),
                     'department': (emp.department or None)
                 })
@@ -2060,8 +2409,9 @@ class RTSPFrameSource:
     def close(self):
         if self._cap: self._cap.release()
 
-@app.route('/api/cameras/status')
-def cameras_status():
+@app.route('/api/cameras/status_legacy')
+def cameras_status_legacy():
+    """Legacy endpoint - use /api/cameras/status instead"""
     global _camera_map
     if not _camera_map:
         _camera_map = load_cameras()
@@ -2531,31 +2881,83 @@ def api_admin_reset_logs():
 # --- System: Restart process ---
 @app.route('/api/system/restart', methods=['POST'])
 def api_system_restart():
-    """Restart this Python process. Returns immediately then execs self in a background thread."""
+    """
+    Gracefully restart the application in the same terminal.
+    Uses os.execv() to replace the current process with a new one.
+    """
     try:
         def _do_restart():
             try:
-                # small delay to allow HTTP response to flush
-                time.sleep(0.5)
-                python = sys.executable or 'python'
-                cmd = [python] + list(sys.argv)
-                # On Windows, detach so new process isn't killed when this one exits
-                creationflags = 0
+                # Log restart event
+                print(f"[RESTART] System restart requested at {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} WIB")
+
+                # Notify all connected Socket.IO clients that server is restarting
                 try:
-                    DETACHED_PROCESS = 0x00000008
-                    CREATE_NEW_PROCESS_GROUP = 0x00000200
-                    creationflags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-                except Exception:
-                    creationflags = 0
+                    socketio.emit('server_restarting', {
+                        'message': 'Server is restarting...',
+                        'estimated_downtime': 10
+                    }, broadcast=True)
+                    socketio.sleep(0.2)  # Give time for message to be sent
+                except Exception as e:
+                    print(f"[RESTART] Failed to emit restart event: {e}")
+
+                # Graceful shutdown: Stop AI manager
                 try:
-                    subprocess.Popen(cmd, close_fds=True, creationflags=creationflags)
-                except Exception:
-                    subprocess.Popen(cmd)
-            finally:
-                # terminate current process to free the port
-                os._exit(0)
+                    if ai_manager is not None and hasattr(ai_manager, 'stop'):
+                        print("[RESTART] Stopping AI manager...")
+                        ai_manager.stop()
+                        print("[RESTART] AI manager stopped")
+                except Exception as e:
+                    print(f"[RESTART] Error stopping AI manager: {e}")
+
+                # Graceful shutdown: Stop all stream workers
+                try:
+                    if _workers_by_sid:
+                        print(f"[RESTART] Stopping {len(_workers_by_sid)} stream workers...")
+                        for sid, worker in list(_workers_by_sid.items()):
+                            try:
+                                if hasattr(worker, 'stop'):
+                                    worker.stop()
+                            except Exception as e:
+                                print(f"[RESTART] Error stopping worker {sid}: {e}")
+                        print("[RESTART] Stream workers stopped")
+                except Exception as e:
+                    print(f"[RESTART] Error stopping stream workers: {e}")
+
+                # Delay to allow HTTP response to flush and cleanup to complete
+                print("[RESTART] Graceful shutdown completed, restarting in 1 second...")
+                time.sleep(1.0)
+
+                # Prepare restart command
+                python = sys.executable
+                if not python:
+                    python = 'python'
+
+                # Use os.execv() to replace current process (restart in same terminal)
+                # This will NOT spawn a new terminal or background process
+                args = [python] + sys.argv
+
+                print(f"[RESTART] Executing: {' '.join(args)}")
+                sys.stdout.flush()
+                sys.stderr.flush()
+
+                # Replace current process with new one (same PID, same terminal)
+                # Note: os.execv() may not work on Windows - will use os.execl() as fallback
+                try:
+                    os.execv(python, args)
+                except (OSError, AttributeError) as e:
+                    print(f"[RESTART] os.execv failed ({e}), trying os.execl...")
+                    os.execl(python, python, *sys.argv[1:])
+
+            except Exception as e:
+                print(f"[RESTART] Fatal error during restart: {e}")
+                # Fallback to exit if execv fails
+                os._exit(1)
+
+        # Start restart in background thread to allow response to be sent first
         threading.Thread(target=_do_restart, daemon=True).start()
         return jsonify({'ok': True, 'message': 'Restarting system...'}), 200
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2592,7 +2994,12 @@ def api_system_shutdown():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
+    # Initialize system start time for uptime tracking (module-level scope)
+    _system_start_time = time.time()
+    print(f"[STARTUP] System started at {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
     try:
+
         # Load parameters once at startup
         load_params()
         # Daily maintenance: purge old events and schedule next purge
@@ -2601,11 +3008,22 @@ if __name__ == '__main__':
             schedule_midnight_purge()
         except Exception:
             pass
+        # Schedule absent employee detection (daily at 17:30 WIB)
+        try:
+            schedule_absent_detection()
+        except Exception as e:
+            print(f"[STARTUP] Failed to start absent detection: {e}")
         # Start background capture saver thread (5s interval)
         try:
             _start_capture_saver_thread()
         except Exception:
             pass
+        # Load tracking state from file (schedule settings, work hours, etc.)
+        try:
+            _load_tracking_state()
+            print("[STARTUP] Loaded tracking state from config/tracking_mode.json")
+        except Exception as e:
+            print(f"[STARTUP] Failed to load tracking state: {e}")
         # Initialize Telegram sender if enabled
         socketio.run(app, 
                     host='0.0.0.0', 

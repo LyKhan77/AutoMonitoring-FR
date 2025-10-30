@@ -168,8 +168,29 @@
         .switch input[type="checkbox"]:checked:active + .slider::after { transform: translateX(calc(var(--button-width) - var(--toggle-wider) - var(--button-toggle-offset))); }
 
         /* Refresh button icon spin on hover/focus */
-        #btn-refresh-page:hover svg,
-        #btn-refresh-page:focus svg { animation: spin 0.6s linear; }
+        #btn-refresh:hover svg,
+        #btn-refresh:focus svg { animation: spin 0.6s linear; }
+
+        /* Large spinner for restart overlay */
+        .spinner-large {
+            border: 6px solid rgba(255, 255, 255, 0.2);
+            border-top: 6px solid #ffffff;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+        }
+
+        /* Restart overlay fade-in animation */
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        .restart-overlay-show {
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        /* No animations - instant show/hide for better performance */
     </style>
 </head>
 <body class="bg-gray-100 text-gray-800 min-h-screen flex flex-col">
@@ -255,67 +276,96 @@
             <!-- CCTV Page -->
             <!-- Halaman utama yang menampilkan feed CCTV dan tracking karyawan -->
             <div id="cctv-page" class="page block">
-                <!-- System Information Panel (moved here) -->
-                <div id="system-info" class="mb-4">
-                    <div class="bg-white border border-gray-200 shadow rounded-xl px-4 py-2 flex items-center gap-4 text-xs">
-                        <div class="text-sm font-semibold text-primary flex-1">System Information</div>
-                        <!-- Schedule status badge -->
-                        <div class="flex items-center gap-2" id="sys-mode">
-                            <span id="sys-mode-icon" class="inline-flex text-gray-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-                            </span>
-                            <span id="sys-mode-text" class="text-gray-600">—</span>
-                        </div>
-                        <div class="hidden sm:block h-5 w-px bg-gray-300"></div>
-                        <div class="flex items-center gap-2" id="sys-net">
-                            <span class="inline-flex items-center">
-                                <svg id="sys-wifi-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-wifi-icon lucide-wifi text-gray-400"><path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.859a10 10 0 0 1 14 0"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/></svg>
-                            </span>
-                            <span id="sys-latency" class="text-gray-400">—</span>
-                        </div>
-                        <div class="hidden sm:block h-5 w-px bg-gray-300"></div>
-                        <!-- Cameras Online badge -->
-                        <div class="flex items-center gap-2" id="sys-cam">
-                            <span class="inline-flex items-center text-gray-500">
-                                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="15" height="10" rx="2"/><path d="M22 11l-5-3v8l5-3z"/></svg>
-                            </span>
-                            <span id="sys-cam-online" class="text-gray-700">Cams Online: —</span>
-                        </div>
-                        <div class="hidden sm:block h-5 w-px bg-gray-300"></div>
-                        <div class="flex items-center gap-2" id="sys-gpu">
-                            <span class="text-gray-500">GPU Usage:</span>
-                            <span id="sys-gpu-val" class="text-gray-700">—</span>
-                        </div>
-                        <div class="hidden sm:block h-5 w-px bg-gray-300"></div>
-                        <div class="flex items-center gap-2" id="sys-mem">
-                            <span class="text-gray-500">Memory Usage:</span>
-                            <span id="sys-mem-val" class="text-gray-700">—</span>
-                        </div>
-                        <div class="hidden sm:block h-5 w-px bg-gray-300"></div>
-                        <button id="btn-refresh-page" type="button" class="inline-flex items-center px-3 py-1 bg-gray-300 text-gray-700 rounded-xl hover:bg-primary hover:text-white focus:outline-none">
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" class="w-4 h-4 mr-2" fill="currentColor" aria-hidden="true">
-                                <path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"></path>
-                                <path fill-rule="evenodd" d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"></path>
-                            </svg>
-                            <span>Refresh</span>
-                        </button>
-                    </div>
-                </div>
+                <!-- System Control Panel (Unified) -->
+                <div id="system-control-panel" class="mb-4 bg-white border border-gray-200 shadow rounded-xl">
+                    <div class="px-4 py-2.5 flex items-center justify-between gap-6">
+                        <!-- Left: System Status -->
+                        <div class="flex items-center gap-3 flex-wrap">
+                            <!-- Schedule Mode Badge -->
+                            <div class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border" id="status-mode">
+                                <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+                                </svg>
+                                <span class="text-xs font-medium" id="mode-text">—</span>
+                            </div>
 
-                <!-- Adjustment Panel (global controls) -->
-                <div id="adjustment-bar" class="mb-4 bg-white border border-gray-200 shadow rounded-xl px-4 py-2 flex items-center gap-3">
-                    <div class="text-sm font-semibold text-primary flex-1">Adjustment Panel</div>
-                    <div class="flex items-center gap-2">
-                        <button id="btn-adj-toggle-feed" class="text-xs px-3 py-1.5 bg-white border border-gray-300 rounded-full hover:bg-gray-50">Hide CCTV Panel</button>
-                        <button id="btn-adj-toggle-cap" class="text-xs px-3 py-1.5 bg-white border border-gray-300 rounded-full hover:bg-gray-50">Hide Capture Panel</button>
-                        <button id="btn-adj-expand-emp" class="text-xs px-3 py-1.5 bg-gray-300 text-gray-700 rounded-full cursor-not-allowed" disabled>Expand Employee Panel</button>
-                        <button id="btn-adj-min-emp" class="text-xs px-3 py-1.5 bg-gray-300 text-gray-700 rounded-full cursor-not-allowed" disabled>Minimize Employee Panel</button>
+                            <!-- Network Latency -->
+                            <div class="flex items-center gap-1.5" id="status-net" title="Network Latency">
+                                <svg id="wifi-icon" class="w-4 h-4 text-gray-500" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.859a10 10 0 0 1 14 0"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/>
+                                </svg>
+                                <span class="text-xs text-gray-600" id="net-val">—</span>
+                            </div>
+
+                            <!-- Cameras Online -->
+                            <div class="flex items-center gap-1.5" id="status-cam" title="Cameras Online">
+                                <svg class="w-4 h-4 text-gray-500" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <rect x="2" y="7" width="15" height="10" rx="2"/><path d="M22 11l-5-3v8l5-3z"/>
+                                </svg>
+                                <span class="text-xs text-gray-600" id="cam-val">—</span>
+                            </div>
+
+                            <!-- Memory Usage -->
+                            <div class="flex items-center gap-1.5" id="status-mem" title="Memory Usage">
+                                <svg class="w-4 h-4 text-gray-500" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>
+                                </svg>
+                                <span class="text-xs text-gray-600" id="mem-val">—</span>
+                            </div>
+
+                            <!-- GPU Usage -->
+                            <div class="flex items-center gap-1.5" id="status-gpu" title="GPU Usage">
+                                <svg class="w-4 h-4 text-gray-500" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                                </svg>
+                                <span class="text-xs text-gray-600" id="gpu-val">—</span>
+                            </div>
+                        </div>
+
+                        <!-- Right: Layout Controls -->
+                        <div class="flex items-center gap-2 border-l border-gray-200 pl-4">
+                            <!-- CCTV Toggle -->
+                            <button id="btn-toggle-feed" class="flex items-center gap-1 px-2.5 py-1 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 text-xs" title="Toggle CCTV Panel">
+                                <svg id="icon-feed" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                    <circle cx="12" cy="12" r="3"></circle>
+                                </svg>
+                                <span id="text-feed">CCTV</span>
+                            </button>
+
+                            <!-- Capture Toggle -->
+                            <button id="btn-toggle-cap" class="flex items-center gap-1 px-2.5 py-1 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 text-xs" title="Toggle Capture Panel">
+                                <svg id="icon-cap" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                    <circle cx="12" cy="12" r="3"></circle>
+                                </svg>
+                                <span>Capture</span>
+                            </button>
+
+                            <!-- Employee Toggle -->
+                            <button id="btn-toggle-emp" class="flex items-center gap-1 px-2.5 py-1 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 text-xs disabled:opacity-50 disabled:cursor-not-allowed" title="Expand Employee Panel" disabled>
+                                <svg id="icon-emp" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path id="icon-emp-maximize" d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>
+                                    <path id="icon-emp-minimize" class="hidden" d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"></path>
+                                </svg>
+                                <span id="text-emp">Employee</span>
+                            </button>
+
+                            <!-- Refresh Button -->
+                            <button id="btn-refresh" class="flex items-center gap-1 px-2.5 py-1 bg-primary text-white rounded-lg hover:bg-blue-700 text-xs" title="Refresh Page">
+                                <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" style="transition: transform 0.6s ease;">
+                                    <path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41zm-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9z"></path>
+                                    <path fill-rule="evenodd" d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5.002 5.002 0 0 0 8 3zM3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9H3.1z"></path>
+                                </svg>
+                                <span>Refresh</span>
+                            </button>
+                        </div>
                     </div>
                 </div>
-                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 h-full">
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 h-full items-start">
                     <!-- Live CCTV Feed -->
                     <!-- Panel kiri menampilkan live feed dari kamera CCTV -->
-                    <section id="cctv-feed" class="lg:col-span-2 bg-white rounded-xl p-6 shadow transition-all">
+                    <section id="cctv-feed" class="lg:col-span-2 bg-white rounded-xl p-6 shadow transition-all h-fit">
                         <!-- Header panel CCTV dengan status AI -->
                         <div class="flex justify-between items-center mb-6">
                             <h2 class="text-xl font-semibold text-primary">Live CCTV Feed</h2>
@@ -337,15 +387,17 @@
                         <!-- Kontrol untuk memilih kamera CCTV yang berbeda -->
                         <div>
                             <h3 id="camera-title" class="text-lg font-medium text-primary mb-4">CCTV CAM</h3>
-                            <div class="flex gap-3" id="camera-buttons">
-                                <!-- Tombol kamera akan diisi oleh JavaScript -->
+                            <div class="overflow-x-auto pb-2">
+                                <div class="flex gap-3" id="camera-buttons">
+                                    <!-- Tombol kamera akan diisi oleh JavaScript -->
+                                </div>
                             </div>
                         </div>
                     </section>
 
                     <!-- Employee Tracking -->
                     <!-- Panel kanan menampilkan tracking karyawan -->
-                    <section id="employee-tracking" class="bg-white rounded-xl p-6 shadow flex flex-col transition-all">
+                    <section id="employee-tracking" class="bg-white rounded-xl p-6 shadow flex flex-col transition-all h-fit">
                         <!-- Header panel tracking dengan jumlah karyawan aktif -->
                         <div class="flex justify-between items-center mb-3">
                             <h2 class="text-xl font-semibold text-primary">Employee Tracking</h2>
@@ -358,7 +410,7 @@
                             </select>
                         </div>
                         <!-- Daftar karyawan yang terdeteksi -->
-                        <div class="flex-1 mb-6 overflow-y-auto" id="employee-list">
+                        <div class="flex-1 mb-6 overflow-y-auto max-h-[500px]" id="employee-list">
                             <!-- Item karyawan akan diisi oleh JavaScript -->
                         </div>
                         
@@ -611,6 +663,7 @@
                     <section id="schedule-system" class="hidden">
                         <div class="flex justify-between items-center mb-3">
                             <h3 class="text-lg font-semibold text-primary">Schedule System</h3>
+                            <div id="schedule-current-time" class="text-sm text-gray-600 font-mono"></div>
                         </div>
                         <div id="schedule-banner" class="mb-3 p-3 rounded border text-sm"></div>
                         <div class="p-3 border rounded bg-gray-50 space-y-3">
@@ -623,11 +676,11 @@
                                     <span>Follow Auto Schedule</span>
                                 </div>
                                 <div>
-                                    <label class="block text-xs text-gray-600 mb-1">Work Hours (HH:MM-HH:MM)</label>
+                                    <label class="block text-xs text-gray-600 mb-1">Work Hours <span class="text-primary font-semibold">(WIB)</span></label>
                                     <input id="sch-work" type="text" class="w-full border rounded px-2 py-1" placeholder="08:30-17:30" />
                                 </div>
                                 <div>
-                                    <label class="block text-xs text-gray-600 mb-1">Lunch Break (HH:MM-HH:MM)</label>
+                                    <label class="block text-xs text-gray-600 mb-1">Lunch Break <span class="text-primary font-semibold">(WIB)</span></label>
                                     <input id="sch-lunch" type="text" class="w-full border rounded px-2 py-1" placeholder="12:00-13:00" />
                                 </div>
                             </div>

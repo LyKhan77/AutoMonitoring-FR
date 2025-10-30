@@ -5,6 +5,12 @@ import json
 import os
 from typing import Optional
 
+# Timezone helper for WIB (UTC+7)
+def _now_wib():
+    """Return current datetime in WIB timezone (UTC+7)."""
+    wib_tz = datetime.timezone(datetime.timedelta(hours=7))
+    return datetime.datetime.now(wib_tz)
+
 from sqlalchemy import (
     create_engine,
     Column,
@@ -24,24 +30,43 @@ from sqlalchemy.orm import relationship, sessionmaker, declarative_base, Session
 from sqlalchemy import event
 
 # --- Konfigurasi Dasar --- #
-# SQLite file will be created under db/attendance.db
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_DIR = os.path.join(BASE_DIR, 'db')
-os.makedirs(DB_DIR, exist_ok=True)
-DB_FILE = os.path.join(DB_DIR, 'attendance.db')
-DATABASE_URL = f"sqlite:///{DB_FILE}"
-Base = declarative_base()
-engine = create_engine(DATABASE_URL, echo=False, future=True)
+# Menggunakan PostgreSQL sebagai database
+# Pastikan Anda telah membuat database dan user sesuai panduan.
+# Aplikasi akan mengambil kredensial dari environment variables jika ada,
+# jika tidak, akan menggunakan nilai default untuk development lokal.
 
-# Ensure SQLite enforces foreign keys when using ondelete='CASCADE'
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    try:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-    except Exception:
-        pass
+DB_HOST = os.getenv("POSTGRES_HOST", "localhost")
+DB_NAME = os.getenv("POSTGRES_DB", "FR")
+DB_USER = os.getenv("POSTGRES_USER", "postgres")
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "778899") # GANTI DENGAN PASSWORD ANDA
+
+# Format URL untuk PostgreSQL
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
+
+Base = declarative_base()
+
+# Optimized connection pool settings for better performance and stability
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    # Connection pool configuration
+    pool_size=10,              # Number of persistent connections (default: 5)
+    max_overflow=20,           # Additional connections when pool is full (default: 10)
+    pool_pre_ping=True,        # Verify connections before using (prevents stale connections)
+    pool_recycle=3600,         # Recycle connections after 1 hour (prevents connection timeout)
+    pool_timeout=30,           # Wait up to 30s for available connection (default: 30)
+    # Performance optimizations
+    connect_args={
+        "connect_timeout": 10,  # Connection timeout 10s
+        "keepalives": 1,        # Enable TCP keepalive
+        "keepalives_idle": 30,  # Keepalive idle time
+        "keepalives_interval": 10,
+        "keepalives_count": 5
+    }
+)
+
+# Session maker untuk koneksi ke database
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
 
 
@@ -80,7 +105,7 @@ class FaceTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'), nullable=False, index=True)
     embedding = Column(LargeBinary, nullable=False)  # simpan bytes dari np.ndarray.tobytes()
-    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=_now_wib, nullable=False)
     # metadata untuk multi-angle dan kualitas
     pose_label = Column(String(16))  # contoh: 'front', 'left', 'right'
     quality_score = Column(Float)    # skor kualitas [0..1] (berdasarkan blur/brightness/size)
@@ -110,7 +135,7 @@ class Event(Base):
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'), nullable=True, index=True)  # None untuk unknown
     camera_id = Column(Integer, ForeignKey('cameras.id'), nullable=False, index=True)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+    timestamp = Column(DateTime, default=_now_wib, nullable=False, index=True)
     similarity_score = Column(Float)  # skor kemiripan jika recognized
     track_id = Column(String)  # opsional: id tracking dari tracker
 
@@ -150,12 +175,14 @@ class Attendance(Base):
     first_in_ts = Column(DateTime)  # kapan pertama terlihat hari itu
     last_out_ts = Column(DateTime)  # kapan terakhir tidak terlihat (keluar area)
     status = Column(String, default='ABSENT')  # PRESENT, ABSENT, LATE, dll
+    entry_type = Column(String, default='AUTO')  # AUTO (AI-detected), MANUAL (admin-set), SYSTEM (scheduler-marked)
 
     employee = relationship("Employee", back_populates="attendances")
 
     __table_args__ = (
         UniqueConstraint('employee_id', 'date', name='uq_attendance_emp_date'),
         Index('ix_attendance_emp_date', 'employee_id', 'date'),
+        Index('ix_attendance_date', 'date'),  # For daily reports and date range scans
     )
 
 
@@ -165,10 +192,10 @@ class AlertLog(Base):
     __tablename__ = 'alert_logs'
 
     id = Column(Integer, primary_key=True, index=True)
-    employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'))
+    employee_id = Column(Integer, ForeignKey('employees.id', ondelete='CASCADE'), index=True)
     camera_id = Column(Integer, ForeignKey('cameras.id'), nullable=True)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
-    alert_type = Column(String)  # contoh: OUT_OF_AREA
+    timestamp = Column(DateTime, default=_now_wib, nullable=False, index=True)
+    alert_type = Column(String, index=True)  # contoh: OUT_OF_AREA
     message = Column(String)
     notified_to = Column(String)  # contoh: Supervisor John Doe / phone number
     notified_telegram = Column(Boolean, default=False, nullable=False, index=True)
@@ -181,46 +208,22 @@ class AlertLog(Base):
     employee = relationship("Employee", back_populates="alert_logs")
     camera = relationship("Camera")
 
+    __table_args__ = (
+        # Composite index for date range + employee filtering (Excel export queries)
+        Index('ix_alert_logs_emp_ts', 'employee_id', 'timestamp'),
+        # Composite index for alert type + timestamp (violation count queries)
+        Index('ix_alert_logs_type_ts', 'alert_type', 'timestamp'),
+        # Composite index for Telegram bot polling (unnotified alerts)
+        Index('ix_alert_logs_telegram_ts', 'notified_telegram', 'timestamp'),
+    )
+
 
 # --- Utilitas DB --- #
 
 def init_db() -> None:
     """Buat semua tabel jika belum ada."""
     Base.metadata.create_all(bind=engine)
-    # --- Lightweight Migrations ---
-    try:
-        with engine.begin() as conn:
-            # 1. Rename cameras.location_zone -> cameras.area (if needed)
-            rows = conn.exec_driver_sql("PRAGMA table_info(cameras)").fetchall()
-            cols = {r[1] for r in rows}  # name at index 1
-            if 'area' not in cols and 'location_zone' in cols:
-                conn.exec_driver_sql("ALTER TABLE cameras RENAME COLUMN location_zone TO area")
-                print("[DB Migration] Renamed column cameras.location_zone to cameras.area")
-            
-            # 2. Add notified_telegram to alert_logs (if needed)
-            rows_alerts = conn.exec_driver_sql("PRAGMA table_info(alert_logs)").fetchall()
-            cols_alerts = {r[1] for r in rows_alerts}
-            if 'notified_telegram' not in cols_alerts:
-                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN notified_telegram BOOLEAN DEFAULT 0 NOT NULL")
-                print("[DB Migration] Added column alert_logs.notified_telegram")
-            
-            # 3. Add camera_id to alert_logs (if needed)
-            if 'camera_id' not in cols_alerts:
-                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN camera_id INTEGER")
-                print("[DB Migration] Added column alert_logs.camera_id")
-            
-            # 4. Add schedule context columns to alert_logs (if needed)
-            if 'schedule_work_hours' not in cols_alerts:
-                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN schedule_work_hours VARCHAR")
-            if 'schedule_lunch_break' not in cols_alerts:
-                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN schedule_lunch_break VARCHAR")
-            if 'schedule_is_manual_pause' not in cols_alerts:
-                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN schedule_is_manual_pause BOOLEAN DEFAULT 0")
-            if 'schedule_tracking_active' not in cols_alerts:
-                conn.exec_driver_sql("ALTER TABLE alert_logs ADD COLUMN schedule_tracking_active BOOLEAN DEFAULT 0")
-    except Exception:
-        pass
-    print(f"Database initialized ({DB_FILE})")
+    print(f"Database tables created successfully.")
 
 
 def get_session() -> Session:

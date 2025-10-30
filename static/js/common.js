@@ -148,4 +148,7 @@
       }catch(_){ resolve(false); }
     });
   };
+
+  // Note: Restart system now uses native browser alerts (no overlay needed)
+  // See settings.js for restart implementation
 })();

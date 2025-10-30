@@ -41,4 +41,5 @@ face_images/
 _tensorrt_cache/
 
 # Doc
-*.md
+#*.md
+documentation/PERFORMANCE_ANALYSIS.md

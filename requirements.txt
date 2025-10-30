@@ -69,3 +69,6 @@ waitress==3.0.2
 wcwidth==0.2.13
 Werkzeug==3.1.3
 wsproto==1.2.0
+psycopg2-binary
+cachetools==5.5.0
+openpyxl==3.1.2

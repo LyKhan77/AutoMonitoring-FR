@@ -2,7 +2,7 @@
     "model": "InsightFace (Buffalo_L)",
     "detection_threshold": 0.6,
     "detection_size": [640, 640],
-    "providers": "CUDAExecutionProvider, CPUExecutionProvider",
+    "providers": "TensorrtExecutionProvider, CUDAExecutionProvider, CPUExecutionProvider",
     "fps_target": 8,
     "stream_max_width": 720,
     "jpeg_quality": 60,
@@ -23,7 +23,7 @@
     "alert_min_interval_sec": 60.0,
     "away_mute_threshold_hours": 15,
     "notification_limit": 10,
-    "mark_absent_enabled": true,
+    "mark_absent_enabled": false,
     "mark_absent_offset_minutes_before_end": 10, 
     
     "attendance_last_out_delay_sec": 10,

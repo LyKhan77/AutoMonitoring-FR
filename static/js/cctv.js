@@ -23,22 +23,21 @@
   const capDelDate = document.getElementById('cap-del-date');
   const btnCapDel = document.getElementById('btn-cap-del');
   const capDelMsg = document.getElementById('cap-del-msg');
-  // Adjustment bar controls
-  const btnAdjToggleFeed = document.getElementById('btn-adj-toggle-feed');
-  const btnAdjExpandEmp = document.getElementById('btn-adj-expand-emp');
-  const btnAdjMinEmp = document.getElementById('btn-adj-min-emp');
-  const btnAdjToggleCap = document.getElementById('btn-adj-toggle-cap');
+  // System Control Panel - Layout controls
+  const btnAdjToggleFeed = document.getElementById('btn-toggle-feed');
+  const btnAdjToggleEmp = document.getElementById('btn-toggle-emp');
+  const btnAdjToggleCap = document.getElementById('btn-toggle-cap');
   const feedSection = document.getElementById('cctv-feed');
   const trackSection = document.getElementById('employee-tracking');
   const captureSection = document.getElementById('frame-capture');
-  // System info elements
-  const sysLatency = document.getElementById('sys-latency');
-  const sysWifiIcon = document.getElementById('sys-wifi-icon');
-  const sysGpuVal = document.getElementById('sys-gpu-val');
-  const sysMemVal = document.getElementById('sys-mem-val');
-  const btnRefreshPage = document.getElementById('btn-refresh-page');
-  const sysModeText = document.getElementById('sys-mode-text');
-  const sysModeIcon = document.getElementById('sys-mode-icon');
+  // System Control Panel - Status elements
+  const sysLatency = document.getElementById('net-val');
+  const sysWifiIcon = document.getElementById('wifi-icon');
+  const sysGpuVal = document.getElementById('gpu-val');
+  const sysMemVal = document.getElementById('mem-val');
+  const btnRefreshPage = document.getElementById('btn-refresh');
+  const sysModeText = document.getElementById('mode-text');
+  const sysModeIcon = document.getElementById('status-mode');
 
   if (!cameraButtonsEl && !elEmpList) return; // not on CCTV page
 
@@ -48,6 +47,13 @@
   let currentCamId = null;
   let lastFrameAt = 0;
   let frameWatch = null;
+
+  // Auto-refresh for frame capture preview
+  let selectedCameraForPreview = null;
+  let selectedCameraCard = null; // Track selected card element for visual indicator
+  let selectedCameraIdForHighlight = null; // Track camera ID to persist highlight across rebuilds
+  let previewUpdateInterval = null;
+  const PREVIEW_REFRESH_INTERVAL_MS = 2000; // 2 seconds
 
   // Real-time alert logs -> on-time notifications (message-based only) with de-dup
   try{
@@ -99,25 +105,58 @@
       const st = await res.json();
       const active = !!st.tracking_active;
       const lunch = !!st.suppress_alerts;
-      let label = 'Off-Hours';
-      let cls = 'text-gray-500';
+      let label = 'Off Hours';
+      let textCls = 'text-gray-700';
+      let bgCls = 'bg-gray-100';
+      let borderCls = 'border-gray-200';
       let icon = 'off';
-      if (lunch){ label = 'Lunch Break'; cls = 'text-yellow-600'; }
-      else if (active){ label = 'Work Hours'; cls = 'text-green-600'; }
-      icon = lunch ? 'lunch' : (active ? 'work' : 'off');
-      if (sysModeText){ sysModeText.textContent = label; sysModeText.classList.remove('text-gray-500','text-green-600','text-yellow-600','text-red-600'); sysModeText.classList.add(cls); }
+
+      if (lunch){
+        label = 'Lunch Break';
+        textCls = 'text-yellow-700';
+        bgCls = 'bg-yellow-50';
+        borderCls = 'border-yellow-200';
+        icon = 'lunch';
+      }
+      else if (active){
+        label = 'Work Hours';
+        textCls = 'text-green-700';
+        bgCls = 'bg-green-50';
+        borderCls = 'border-green-200';
+        icon = 'work';
+      }
+      else {
+        label = 'Off Hours';
+        textCls = 'text-gray-700';
+        bgCls = 'bg-gray-100';
+        borderCls = 'border-gray-200';
+        icon = 'off';
+      }
+
+      // Update badge text and colors
+      if (sysModeText){
+        sysModeText.textContent = label;
+        sysModeText.classList.remove('text-gray-700','text-green-700','text-yellow-700','text-red-700');
+        sysModeText.classList.add(textCls);
+      }
+
+      // Update badge background and border
       if (sysModeIcon){
-        sysModeIcon.classList.remove('text-gray-500','text-green-600','text-yellow-600','text-red-600');
-        sysModeIcon.classList.add(cls);
-        // swap icon per mode
-        if (icon === 'work'){
-          sysModeIcon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12.8V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h11"/></svg>';
-        } else if (icon === 'lunch'){
-          // pause circle style
-          sysModeIcon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="10" y1="9" x2="10" y2="15"/><line x1="14" y1="9" x2="14" y2="15"/></svg>';
-        } else {
-          // moon icon for off-hours
-          sysModeIcon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+        sysModeIcon.classList.remove('bg-gray-100','bg-green-50','bg-yellow-50','bg-orange-50');
+        sysModeIcon.classList.remove('border-gray-200','border-gray-300','border-green-200','border-yellow-200','border-orange-200');
+        sysModeIcon.classList.add(bgCls, borderCls);
+
+        // Update icon SVG
+        const svg = sysModeIcon.querySelector('svg');
+        if (svg){
+          svg.classList.remove('text-gray-700','text-green-700','text-yellow-700','text-gray-600');
+          if (icon === 'work'){
+            svg.classList.add('text-green-700');
+          } else if (icon === 'lunch'){
+            svg.classList.add('text-yellow-700');
+          } else {
+            svg.classList.add('text-gray-600');
+          }
         }
       }
     }catch(_e){
@@ -265,6 +304,8 @@
       cameraButtonsEl.innerHTML = `<div class="text-sm text-danger">Failed to load cameras (${App.safe ? App.safe(msg) : msg})</div>`;
       console.error('Failed to load /api/cameras:', e);
     }
+    // Sync employee height after cameras loaded (CCTV panel size may change)
+    syncEmployeeHeight();
   }
 
   async function updateAIIndicatorFor(camId){
@@ -298,13 +339,55 @@
   }
 
   // --- Frame Capture helpers ---
+  // Auto-update preview for selected camera (polling-based)
+  async function updateLivePreview(){
+    if (!selectedCameraForPreview || !capView) return;
+    try {
+      const res = await fetch('/api/captures/per_camera_latest', { cache: 'no-store' });
+      const rows = await res.json();
+      const items = Array.isArray(rows) ? rows : [];
+      const cameraData = items.find(r => r && r.cam_id === selectedCameraForPreview);
+
+      if (cameraData && cameraData.url) {
+        // Only update if URL changed (prevents unnecessary DOM updates)
+        if (capView.src !== cameraData.url && !capView.src.endsWith(cameraData.url)) {
+          capView.src = cameraData.url;
+          capView.classList.remove('hidden');
+          if (capViewPh) capViewPh.classList.add('hidden');
+        }
+      }
+    } catch(e) {
+      // Silently fail - don't break the page if API temporarily unavailable
+      console.warn('[Frame Capture] Failed to update live preview:', e);
+    }
+  }
+
   // Auto per-camera capture previews (latest frame per active camera)
   async function refreshCapturePreviews(){
     if (!capList) return;
     try{
-      const res = await fetch('/api/captures/per_camera_latest', { cache: 'no-store' });
-      const rows = await res.json();
+      // Fetch capture data and camera status in parallel
+      const [capturesRes, statusRes] = await Promise.all([
+        fetch('/api/captures/per_camera_latest', { cache: 'no-store' }),
+        fetch('/api/cameras/status', { cache: 'no-store' })
+      ]);
+      const rows = await capturesRes.json();
+      const statusData = await statusRes.json();
+
       const items = Array.isArray(rows) ? rows : [];
+      const statusList = Array.isArray(statusData) ? statusData : (statusData.items || []);
+
+      // Create status map for quick lookup
+      const statusMap = {};
+      statusList.forEach(s => {
+        if (s && s.id != null) {
+          statusMap[s.id] = {
+            ai_running: s.ai_running || false,
+            stream_enabled: s.stream_enabled || false
+          };
+        }
+      });
+
       capList.innerHTML = '';
       if (!items.length){ capList.innerHTML = '<div class="text-xs text-gray-500">No captures</div>'; return; }
       items.forEach((it)=>{
@@ -313,18 +396,70 @@
         const name = (it && it.name) ? String(it.name) : (`CAM ${it && it.cam_id != null ? it.cam_id : ''}`);
         const tsIso = (it && it.timestamp) ? String(it.timestamp) : null;
         const tsText = (window.App && typeof App.formatTs === 'function') && tsIso ? App.formatTs(tsIso) : (tsIso || '');
+
+        // Get camera status (ai_running or stream_enabled = active)
+        const camId = it && it.cam_id != null ? it.cam_id : null;
+        const status = camId != null ? (statusMap[camId] || {}) : {};
+        const isActive = status.ai_running || status.stream_enabled || false;
+
+        // Dynamic badge based on camera status
+        const badgeText = isActive ? 'LIVE' : 'OFFLINE';
+        const badgeColor = isActive ? 'bg-green-500' : 'bg-gray-500';
+
         const card = document.createElement('div');
-        card.className = 'cursor-pointer border rounded overflow-hidden bg-white hover:shadow';
+        card.className = 'relative cursor-pointer border rounded overflow-hidden bg-white hover:shadow transition-all';
         card.innerHTML = `
           <div class="w-full h-28 bg-gray-100 flex items-center justify-center overflow-hidden">${url?`<img src="${url}" class="w-full h-full object-cover" />`:'<span class="text-xs text-gray-500">No snapshot</span>'}</div>
           <div class="p-2 text-[11px] text-gray-600 truncate">${area ? App.safe(area) + ' - ' : ''}${App.safe(name)}</div>
           <div class="px-2 pb-2 text-[10px] text-gray-400 truncate">${App.safe(tsText)}</div>
+          <div class="selected-badge hidden absolute top-1 right-1 ${badgeColor} text-white text-[9px] font-semibold px-1.5 py-0.5 rounded-full shadow-sm">${badgeText}</div>
         `;
         card.addEventListener('click', ()=>{
+          // Update preview immediately
           if (url && capView){ capView.src = url; capView.classList.remove('hidden'); }
           if (capViewPh){ capViewPh.classList.add('hidden'); }
+
+          // Remove selection from previous card ONLY if it's a DIFFERENT card
+          if (selectedCameraCard && selectedCameraCard !== card) {
+            selectedCameraCard.classList.remove('border-gray-200', 'border-2', 'shadow-md');
+            selectedCameraCard.classList.add('border');
+            const oldBadge = selectedCameraCard.querySelector('.selected-badge');
+            if (oldBadge) oldBadge.classList.add('hidden');
+          }
+
+          // Add selection to current card (stays highlighted even on re-click)
+          card.classList.remove('border');
+          card.classList.add('border-gray-200', 'border-2', 'shadow-md');
+          const badge = card.querySelector('.selected-badge');
+          if (badge) badge.classList.remove('hidden');
+          selectedCameraCard = card;
+
+          // Save camera ID for persistence across rebuilds
+          const camId = it && it.cam_id != null ? it.cam_id : null;
+          selectedCameraIdForHighlight = camId;
+
+          // Start auto-refresh for this camera
+          selectedCameraForPreview = camId;
+          if (selectedCameraForPreview != null) {
+            // Clear any existing interval first
+            if (previewUpdateInterval) {
+              clearInterval(previewUpdateInterval);
+              previewUpdateInterval = null;
+            }
+            // Start polling for updates
+            previewUpdateInterval = setInterval(updateLivePreview, PREVIEW_REFRESH_INTERVAL_MS);
+          }
         });
         capList.appendChild(card);
+
+        // Re-apply highlight if this is the previously selected camera (persist across rebuilds)
+        if (selectedCameraIdForHighlight != null && it && it.cam_id === selectedCameraIdForHighlight) {
+          card.classList.remove('border');
+          card.classList.add('border-gray-200', 'border-2', 'shadow-md');
+          const badge = card.querySelector('.selected-badge');
+          if (badge) badge.classList.remove('hidden');
+          selectedCameraCard = card; // Update reference to new card element
+        }
       });
     }catch(_e){ capList.innerHTML = '<div class="text-xs text-gray-500">Failed to load previews</div>'; }
   }
@@ -495,7 +630,14 @@
         loadCameras();
       }
     });
-    window.addEventListener('beforeunload', () => { if (currentCamId !== null) socket.emit('stop_stream', { cam_id: currentCamId }); });
+    window.addEventListener('beforeunload', () => {
+      if (currentCamId !== null) socket.emit('stop_stream', { cam_id: currentCamId });
+      // Cleanup frame capture preview auto-refresh interval
+      if (previewUpdateInterval) {
+        clearInterval(previewUpdateInterval);
+        previewUpdateInterval = null;
+      }
+    });
   }
 
   // Expose loader and run initially
@@ -532,26 +674,27 @@
   // Cameras Online badge updater
   async function updateCamerasOnline(){
     try{
-      const el = document.getElementById('sys-cam-online');
-      const icon = document.querySelector('#sys-cam svg');
+      const el = document.getElementById('cam-val');
+      const icon = document.querySelector('#status-cam svg');
       if (!el) return;
       const res = await fetch('/api/cameras/status');
       const data = await res.json();
       const items = (data && Array.isArray(data.items)) ? data.items : [];
       const total = items.length;
       const online = items.reduce((acc, it)=> acc + ((it && (it.ai_running || it.stream_enabled)) ? 1 : 0), 0);
-      el.textContent = `CAM Online(s): ${online}${total?`/${total}`:''}`;
+      el.textContent = `${online}${total?`/${total}`:''}`; // Simplified: just "2/4"
+      el.title = `Cameras Online: ${online} of ${total}`; // Full text in tooltip
       if (icon){
         // reset classes then apply color
         try{
-          icon.classList.remove('text-gray-400','text-green-600');
+          icon.classList.remove('text-gray-500','text-green-600');
           if (online > 0){ icon.classList.add('text-green-600'); }
-          else { icon.classList.add('text-gray-400'); }
+          else { icon.classList.add('text-gray-500'); }
         }catch(_){ /* ignore */ }
       }
       try{
-        el.classList.remove('text-gray-700','text-green-700');
-        el.classList.add(online>0 ? 'text-green-700' : 'text-gray-700');
+        el.classList.remove('text-gray-600','text-green-700');
+        el.classList.add(online>0 ? 'text-green-700' : 'text-gray-600');
       }catch(_){ }
     }catch(_){ /* ignore */ }
   }
@@ -684,6 +827,30 @@
   }
   let state = (function(){ const saved = _loadLayout(); return saved ? { feedHidden: !!saved.feedHidden, empExpanded: !!saved.empExpanded, capHidden: !!saved.capHidden } : { feedHidden: false, empExpanded: false, capHidden: false }; })();
 
+  // Helper function to sync Employee Tracking height
+  function syncEmployeeHeight(){
+    try{
+      requestAnimationFrame(() => {
+        let targetHeight = 0;
+        if (!state.feedHidden && feedSection){
+          targetHeight = Math.max(targetHeight, feedSection.offsetHeight);
+        }
+        if (!state.capHidden && captureSection){
+          targetHeight = Math.max(targetHeight, captureSection.offsetHeight);
+        }
+        if (trackSection && !state.empExpanded){
+          if (targetHeight > 0){
+            trackSection.style.height = targetHeight + 'px';
+          } else {
+            trackSection.style.height = 'fit-content';
+          }
+        } else if (trackSection){
+          trackSection.style.height = 'fit-content';
+        }
+      });
+    }catch(_e){}
+  }
+
   function applyLayout(animate=true){
     if (!feedSection || !trackSection) return;
     // Add transition classes
@@ -695,7 +862,7 @@
       if (state.capHidden){ captureSection.classList.add('hidden'); }
       else { captureSection.classList.remove('hidden'); }
     }
-    if (btnAdjToggleCap){ btnAdjToggleCap.textContent = state.capHidden ? 'Show Capture Panel' : 'Hide Capture Panel'; }
+    // Note: Capture button icon/text updated in dedicated section below (line ~850)
 
     // Reorder panels to keep Employee at top-right always
     try{
@@ -720,52 +887,67 @@
       }
     }catch(e){ /* noop */ }
 
-    // CCTV feed visibility (left area remains empty when hidden)
+    // CCTV feed visibility - instant show/hide
+    const iconFeed = document.getElementById('icon-feed');
     if (state.feedHidden){
       feedSection.classList.add('hidden');
-      if (btnAdjToggleFeed){ btnAdjToggleFeed.textContent = 'Show CCTV Panel'; }
+      if (btnAdjToggleFeed){ btnAdjToggleFeed.title = 'Show CCTV Panel'; }
+      if (iconFeed){ iconFeed.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line>'; }
     } else {
       feedSection.classList.remove('hidden');
-      if (btnAdjToggleFeed){ btnAdjToggleFeed.textContent = 'Hide CCTV Panel'; }
+      if (btnAdjToggleFeed){ btnAdjToggleFeed.title = 'Hide CCTV Panel'; }
+      if (iconFeed){ iconFeed.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>'; }
     }
-    // Employee layout rules
+
+    // Capture panel visibility - instant show/hide
+    const iconCap = document.getElementById('icon-cap');
+    if (state.capHidden){
+      if (captureSection){ captureSection.classList.add('hidden'); }
+      if (btnAdjToggleCap){ btnAdjToggleCap.title = 'Show Frame Capture Panel'; }
+      if (iconCap){ iconCap.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line>'; }
+    } else {
+      if (captureSection){ captureSection.classList.remove('hidden'); }
+      if (btnAdjToggleCap){ btnAdjToggleCap.title = 'Hide Frame Capture Panel'; }
+      if (iconCap){ iconCap.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>'; }
+    }
+
+    // Employee layout rules - instant expand/minimize
     // - Always keep employee at right (col-start-3) when NOT expanded, regardless of feed/capture visibility
     // - When expanded, span all 3 columns and normal list turns into 3-col grid
+    const iconEmpMaximize = document.getElementById('icon-emp-maximize');
+    const iconEmpMinimize = document.getElementById('icon-emp-minimize');
+
     if (!state.empExpanded){
+      // Minimize state
       trackSection.classList.remove('lg:col-span-3');
       trackSection.classList.add('lg:col-start-3');
       if (elEmpList){ elEmpList.classList.remove('grid','grid-cols-3','gap-3'); }
+
+      // Update button to show "expand" state
+      if (iconEmpMaximize){ iconEmpMaximize.classList.remove('hidden'); }
+      if (iconEmpMinimize){ iconEmpMinimize.classList.add('hidden'); }
+      if (btnAdjToggleEmp){ btnAdjToggleEmp.title = 'Expand Employee Panel'; }
     } else {
+      // Expand state
       trackSection.classList.add('lg:col-span-3');
       trackSection.classList.remove('lg:col-start-3');
       if (elEmpList){ elEmpList.classList.add('grid','grid-cols-3','gap-3'); }
+
+      // Update button to show "minimize" state
+      if (iconEmpMaximize){ iconEmpMaximize.classList.add('hidden'); }
+      if (iconEmpMinimize){ iconEmpMinimize.classList.remove('hidden'); }
+      if (btnAdjToggleEmp){ btnAdjToggleEmp.title = 'Minimize Employee Panel'; }
     }
-    // Buttons enable/disable
-    if (btnAdjExpandEmp){
-      // Expand allowed only when BOTH CCTV and Capture are hidden, and not already expanded
-      const enable = !!state.feedHidden && !!state.capHidden && !state.empExpanded;
-      btnAdjExpandEmp.disabled = !enable;
-      btnAdjExpandEmp.classList.toggle('cursor-not-allowed', !enable);
-      btnAdjExpandEmp.classList.toggle('bg-gray-300', !enable);
-      btnAdjExpandEmp.classList.toggle('text-gray-700', !enable);
-      btnAdjExpandEmp.classList.toggle('bg-white', enable);
-      btnAdjExpandEmp.classList.toggle('border', enable);
-      btnAdjExpandEmp.classList.toggle('border-gray-300', enable);
-      btnAdjExpandEmp.classList.toggle('hover:bg-gray-50', enable);
+
+    // Enable/disable employee toggle button (only when BOTH CCTV and Capture are hidden)
+    if (btnAdjToggleEmp){
+      const canToggleEmp = state.feedHidden && state.capHidden;
+      btnAdjToggleEmp.disabled = !canToggleEmp;
     }
-    if (btnAdjMinEmp){
-      // Minimize allowed only when expanded
-      const enableMin = !!state.empExpanded;
-      btnAdjMinEmp.disabled = !enableMin;
-      btnAdjMinEmp.classList.toggle('cursor-not-allowed', !enableMin);
-      btnAdjMinEmp.classList.toggle('bg-gray-300', !enableMin);
-      btnAdjMinEmp.classList.toggle('text-gray-700', !enableMin);
-      btnAdjMinEmp.classList.toggle('bg-white', enableMin);
-      btnAdjMinEmp.classList.toggle('border', enableMin);
-      btnAdjMinEmp.classList.toggle('border-gray-300', enableMin);
-      btnAdjMinEmp.classList.toggle('hover:bg-gray-50', enableMin);
-      btnAdjMinEmp.textContent = 'Minimize Employee Panel';
-    }
+
+    // Sync Employee Tracking height to match CCTV/Capture panel height
+    syncEmployeeHeight();
+
     // Persist layout after each apply
     _saveLayout(state);
     // Debounced refresh for camera UI if layout changes hide/show panels
@@ -779,10 +961,30 @@
   // Seed saved area filter on first load (in case loadCameras hasn't set it yet)
   try{ const savedArea = localStorage.getItem(LSK_AREA) || ''; if (areaFilter && savedArea) areaFilter.value = savedArea; }catch(_e){}
   // Handlers
-  if (btnAdjToggleFeed){ btnAdjToggleFeed.addEventListener('click', ()=>{ state.feedHidden = !state.feedHidden; if (!state.feedHidden){ state.empExpanded = false; } applyLayout(true); }); }
-  if (btnAdjExpandEmp){ btnAdjExpandEmp.addEventListener('click', ()=>{ if (state.feedHidden && !state.empExpanded){ state.empExpanded = true; applyLayout(true); } }); }
-  if (btnAdjMinEmp){ btnAdjMinEmp.addEventListener('click', ()=>{ if (state.empExpanded){ state.empExpanded = false; applyLayout(true); } }); }
-  if (btnAdjToggleCap){ btnAdjToggleCap.addEventListener('click', ()=>{ state.capHidden = !state.capHidden; applyLayout(true); }); }
+  // Toggle CCTV Panel with animation
+  if (btnAdjToggleFeed){
+    btnAdjToggleFeed.addEventListener('click', ()=>{
+      state.feedHidden = !state.feedHidden;
+      if (!state.feedHidden){ state.empExpanded = false; } // Auto-minimize employee when showing CCTV
+      applyLayout(true);
+    });
+  }
+  // Toggle Capture Panel with animation
+  if (btnAdjToggleCap){
+    btnAdjToggleCap.addEventListener('click', ()=>{
+      state.capHidden = !state.capHidden;
+      applyLayout(true);
+    });
+  }
+  // Toggle Employee Expand/Minimize (single button)
+  if (btnAdjToggleEmp){
+    btnAdjToggleEmp.addEventListener('click', ()=>{
+      if (state.feedHidden && state.capHidden){
+        state.empExpanded = !state.empExpanded; // Toggle between expand and minimize
+        applyLayout(true);
+      }
+    });
+  }
 
   // Cross-tab sync via storage events
   window.addEventListener('storage', (e)=>{
@@ -803,4 +1005,8 @@
       }
     }catch(_e){}
   });
+
+  // Sync employee height on window load and resize
+  window.addEventListener('load', ()=>{ syncEmployeeHeight(); });
+  window.addEventListener('resize', ()=>{ syncEmployeeHeight(); });
 })();
