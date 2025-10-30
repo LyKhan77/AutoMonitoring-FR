@@ -42,3 +42,4 @@ _tensorrt_cache/
 
 # Doc
 *.md
+!README.md
